@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Auto Draw Web</title>
+<style>
+body { background:#111; color:white; text-align:center; font-family:Arial; }
+canvas { border:1px solid #0f0; margin-top:10px; }
+</style>
+</head>
+<body>
+
+<h2>🎨 Auto Draw Web</h2>
+<canvas id="c"></canvas>
+
+<script>
+const params = new URLSearchParams(location.search);
+const imgUrl = params.get("img");
+
+if(!imgUrl){
+  document.body.innerHTML += "<p>❌ Không có link ảnh</p>";
+}else{
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  img.onload = () => {
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.drawImage(img,0,0);
+
+    // Giả lập vẽ lại từng nét
+    const data = ctx.getImageData(0,0,canvas.width,canvas.height);
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    let i = 0;
+    function drawStep(){
+      for(let n=0;n<5000;n++){
+        if(i >= data.data.length) return;
+        const idx = i;
+        const r = data.data[idx];
+        const g = data.data[idx+1];
+        const b = data.data[idx+2];
+        const a = data.data[idx+3];
+        const p = idx/4;
+        const x = p % canvas.width;
+        const y = Math.floor(p / canvas.width);
+
+        if((r+g+b)/3 < 200){
+          ctx.fillStyle = "white";
+          ctx.fillRect(x,y,1,1);
+        }
+        i += 4;
+      }
+      requestAnimationFrame(drawStep);
+    }
+    drawStep();
+  };
+  img.src = imgUrl;
+}
+</script>
+
+</body>
+</html>
