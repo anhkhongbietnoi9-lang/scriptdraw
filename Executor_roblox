@@ -1,0 +1,590 @@
+# neural_secure.py - Secure Neural Console với command whitelist
+import asyncio
+import json
+import os
+import sys
+import time
+import hashlib
+import secrets
+from datetime import datetime
+import threading
+from typing import Dict, Any, Optional, Set
+import signal
+from collections import deque
+
+from websockets.asyncio.server import serve
+import websockets
+
+class SecureNeuralConsole:
+    def __init__(self):
+        self.clients: Dict[str, Dict[str, Any]] = {}
+        self.session_id = self.generate_session_id()
+        self.start_time = datetime.now()
+        self.activity_logs = deque(maxlen=100)
+        self.command_history = []
+        self.broadcast_id = 0
+        self.running = True
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        
+        # Authentication
+        self.auth_tokens: Dict[str, str] = {}  # client_id -> token
+        self.valid_tokens: Set[str] = set()
+        
+        # Rate limiting
+        self.rate_limits: Dict[str, deque] = {}
+        self.max_requests_per_minute = 60
+        
+        # Command whitelist
+        self.allowed_commands = {
+            'stats', 'ping', 'sync', 'notify', 'status'
+        }
+        
+        # Terminal colors
+        self.C = {
+            'reset': '\033[0m',
+            'bold': '\033[1m',
+            'red': '\033[91m',
+            'green': '\033[92m',
+            'yellow': '\033[93m',
+            'blue': '\033[94m',
+            'magenta': '\033[95m',
+            'cyan': '\033[96m',
+            'white': '\033[97m',
+            'dim': '\033[2m'
+        }
+        
+    def generate_session_id(self) -> str:
+        return f"{secrets.token_hex(4).upper()}-{secrets.token_hex(4).upper()}"
+    
+    def generate_auth_token(self) -> str:
+        return secrets.token_hex(32)
+    
+    def clear_screen(self):
+        os.system('clear' if os.name == 'posix' else 'cls')
+    
+    def log_activity(self, message: str):
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.activity_logs.append(f"{self.C['dim']}{timestamp}{self.C['reset']}  {message}")
+    
+    def print_banner(self):
+        banner = f"""
+{self.C['cyan']}╔══════════════════════════════════════════════════════════════╗
+║  ███╗   ██╗███████╗██╗   ██╗██████╗  █████╗ ██╗            ║
+║  ████╗  ██║██╔════╝██║   ██║██╔══██╗██╔══██╗██║            ║
+║  ██╔██╗ ██║█████╗  ██║   ██║██████╔╝███████║██║            ║
+║  ██║╚██╗██║██╔══╝  ██║   ██║██╔══██╗██╔══██║██║            ║
+║  ██║ ╚████║███████╗╚██████╔╝██║  ██║██║  ██║███████╗       ║
+║  ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝       ║
+║                                                              ║
+║         S E C U R E   N E U R A L   C O N S O L E          ║
+╚══════════════════════════════════════════════════════════════╝{self.C['reset']}
+"""
+        print(banner)
+    
+    def print_status_panel(self):
+        uptime = str(datetime.now() - self.start_time).split('.')[0]
+        client_count = len(self.clients)
+        
+        avg_ping = 0
+        avg_fps = 0
+        avg_rtt = 0
+        if self.clients:
+            pings = [c.get('ping', 0) for c in self.clients.values() if c.get('ping')]
+            fps_list = [c.get('fps', 0) for c in self.clients.values() if c.get('fps')]
+            rtts = [c.get('rtt', 0) for c in self.clients.values() if c.get('rtt')]
+            if pings:
+                avg_ping = sum(pings) / len(pings)
+            if fps_list:
+                avg_fps = sum(fps_list) / len(fps_list)
+            if rtts:
+                avg_rtt = sum(rtts) / len(rtts)
+        
+        panel = f"""
+{self.C['cyan']}┌─ SYSTEM ──────────────────────────────────────────────────────┐
+│ STATUS       : {self.C['green']}● ONLINE{self.C['cyan']}                                      │
+│ SESSION      : {self.C['yellow']}{self.session_id}{self.C['cyan']}                                     │
+│ CONNECTION   : WEBSOCKET                                     │
+│ AVG RTT      : {self.C['green']}{avg_rtt:.1f} ms{self.C['cyan']}                                      │
+│ AVG PING     : {self.C['green']}{avg_ping:.1f} ms{self.C['cyan']}                                      │
+│ AVG FPS      : {self.C['green']}{avg_fps:.0f} FPS{self.C['cyan']}                                      │
+│ CLIENTS      : {self.C['yellow']}{client_count:02d}{self.C['cyan']}                                            │
+│ UPTIME       : {self.C['green']}{uptime}{self.C['cyan']}                                      │
+└───────────────────────────────────────────────────────────────┘
+
+┌─ NETWORK ─────────────────────────────────────────────────────┐
+│ [████████████████████████████████████] 100%                  │
+│                                                              │
+│ LOCAL NODE   : {self.C['yellow']}192.168.1.100{self.C['cyan']}                                 │
+│ PORT         : {self.C['yellow']}8765{self.C['cyan']}                                          │
+│ PROTOCOL     : WSS                                           │
+│ ENCRYPTION   : {self.C['green']}ACTIVE{self.C['cyan']}                                        │
+└───────────────────────────────────────────────────────────────┘"""
+        print(panel)
+    
+    def print_client_info(self):
+        if not self.clients:
+            print(f"{self.C['cyan']}┌─ CLIENT ─────────────────────────────────────────────────────┐")
+            print(f"│ {self.C['yellow']}No clients connected{self.C['cyan']}                                    │")
+            print(f"└───────────────────────────────────────────────────────────────┘")
+            return
+            
+        for client_id, client_data in self.clients.items():
+            last_event = client_data.get('last_event', 'N/A')
+            ping = client_data.get('ping', 0)
+            fps = client_data.get('fps', 0)
+            rtt = client_data.get('rtt', 0)
+            uptime = client_data.get('client_uptime', 'N/A')
+            memory = client_data.get('memory', 'N/A')
+            authenticated = client_data.get('authenticated', False)
+            
+            ping_color = self.C['green'] if ping < 50 else (self.C['yellow'] if ping < 100 else self.C['red'])
+            fps_color = self.C['green'] if fps > 60 else (self.C['yellow'] if fps > 30 else self.C['red'])
+            rtt_color = self.C['green'] if rtt < 20 else (self.C['yellow'] if rtt < 50 else self.C['red'])
+            auth_status = f"{self.C['green']}✓{self.C['reset']}" if authenticated else f"{self.C['red']}✗{self.C['reset']}"
+            
+            panel = f"""
+{self.C['cyan']}┌─ CLIENT ─────────────────────────────────────────────────────┐
+│ ID           : {self.C['yellow']}{client_id}{self.C['cyan']}                                   │
+│ STATE        : {self.C['green']}● CONNECTED{self.C['cyan']}                                   │
+│ AUTH         : {auth_status}                                             │
+│ RTT (WS)     : {rtt_color}{rtt:.1f} ms{self.C['cyan']}                                     │
+│ PING (Game)  : {ping_color}{ping:.1f} ms{self.C['cyan']}                                     │
+│ FPS          : {fps_color}{fps:.0f} FPS{self.C['cyan']}                                     │
+│ UPTIME       : {self.C['yellow']}{uptime}{self.C['cyan']}                                          │
+│ MEMORY       : {self.C['yellow']}{memory}{self.C['cyan']}                                          │
+│ LAST EVENT   : {self.C['blue']}{last_event}{self.C['cyan']}                                   │
+└───────────────────────────────────────────────────────────────┘"""
+            print(panel)
+    
+    def print_activity_log(self, lines=6):
+        logs = list(self.activity_logs)[-lines:] if self.activity_logs else [f"{self.C['dim']}No activity logged{self.C['reset']}"]
+        
+        print(f"{self.C['cyan']}┌─ ACTIVITY ────────────────────────────────────────────────────┐")
+        for log in logs:
+            print(f"│ {log}")
+        print(f"└───────────────────────────────────────────────────────────────┘")
+    
+    def print_terminal_prompt(self):
+        print(f"\n{self.C['green']}╭───────────────────────────────────────────────────────────────╮")
+        print(f"│ {self.C['yellow']}hacker{self.C['cyan']}@{self.C['blue']}neural{self.C['cyan']}:~$ {self.C['reset']}", end='')
+    
+    def print_help(self):
+        help_text = f"""
+{self.C['cyan']}╭─ COMMAND CENTER ─────────────────────────────────────────╮
+│                                          │
+│  {self.C['yellow']}clients{self.C['cyan']}       List connected clients    │
+│  {self.C['yellow']}status{self.C['cyan']}        System status             │
+│  {self.C['yellow']}stats{self.C['cyan']}         Show client stats         │
+│  {self.C['yellow']}notify{self.C['cyan']}        Send notification         │
+│  {self.C['yellow']}logs{self.C['cyan']}          View activity logs        │
+│  {self.C['yellow']}session{self.C['cyan']}       Show current session      │
+│  {self.C['yellow']}clear{self.C['cyan']}         Clear console             │
+│  {self.C['yellow']}exit{self.C['cyan']}          Shutdown server           │
+│                                          │
+╰──────────────────────────────────────────╯{self.C['reset']}"""
+        print(help_text)
+    
+    def is_rate_limited(self, client_id: str) -> bool:
+        """Check if client is rate limited"""
+        now = time.time()
+        if client_id not in self.rate_limits:
+            self.rate_limits[client_id] = deque(maxlen=self.max_requests_per_minute)
+        
+        # Remove old timestamps
+        while self.rate_limits[client_id] and self.rate_limits[client_id][0] < now - 60:
+            self.rate_limits[client_id].popleft()
+        
+        if len(self.rate_limits[client_id]) >= self.max_requests_per_minute:
+            return True
+        
+        self.rate_limits[client_id].append(now)
+        return False
+    
+    async def handle_client(self, websocket):
+        client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
+        client_id = f"RBX-{secrets.token_hex(4).upper()}"
+        
+        self.clients[client_id] = {
+            'ws': websocket,
+            'connected_at': datetime.now(),
+            'ip': client_ip,
+            'last_event': 'HANDSHAKE',
+            'ping': 0,
+            'fps': 0,
+            'rtt': 0,
+            'client_uptime': 'N/A',
+            'memory': 'N/A',
+            'authenticated': False,
+            'auth_token': self.generate_auth_token(),
+            'packets_received': 0,
+            'packets_sent': 0,
+            'ping_history': deque(maxlen=30),
+            'fps_history': deque(maxlen=30)
+        }
+        
+        self.auth_tokens[client_id] = self.clients[client_id]['auth_token']
+        self.valid_tokens.add(self.clients[client_id]['auth_token'])
+        
+        self.log_activity(f"{self.C['green']}[WS]{self.C['reset']}     Connection from {client_id} ({client_ip})")
+        
+        try:
+            # Send handshake với auth token
+            await self.send_handshake(websocket, client_id)
+            
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    self.clients[client_id]['packets_received'] += 1
+                    
+                    # Rate limiting
+                    if self.is_rate_limited(client_id):
+                        await websocket.send(json.dumps({
+                            'type': 'error',
+                            'code': 'RATE_LIMITED',
+                            'message': 'Too many requests'
+                        }))
+                        continue
+                    
+                    await self.process_command(client_id, data)
+                except json.JSONDecodeError:
+                    self.log_activity(f"{self.C['red']}[ERR]{self.C['reset']}    Invalid JSON from {client_id}")
+                    await websocket.send(json.dumps({
+                        'type': 'error',
+                        'code': 'INVALID_JSON',
+                        'message': 'Invalid JSON format'
+                    }))
+                    
+        except websockets.exceptions.ConnectionClosed:
+            self.log_activity(f"{self.C['red']}[DISC]{self.C['reset']}   Client {client_id} disconnected")
+        finally:
+            if client_id in self.clients:
+                # Clean up auth tokens
+                if client_id in self.auth_tokens:
+                    self.valid_tokens.discard(self.auth_tokens[client_id])
+                    del self.auth_tokens[client_id]
+                if client_id in self.rate_limits:
+                    del self.rate_limits[client_id]
+                del self.clients[client_id]
+    
+    async def send_handshake(self, websocket, client_id: str):
+        """Send handshake with auth token"""
+        handshake = {
+            'type': 'handshake',
+            'session_id': self.session_id,
+            'client_id': client_id,
+            'auth_token': self.clients[client_id]['auth_token'],
+            'timestamp': datetime.now().isoformat()
+        }
+        await websocket.send(json.dumps(handshake))
+        self.clients[client_id]['packets_sent'] += 1
+        self.log_activity(f"{self.C['blue']}[AUTH]{self.C['reset']}   Token sent to {client_id}")
+    
+    def verify_auth(self, client_id: str, token: str) -> bool:
+        """Verify client authentication"""
+        if client_id not in self.auth_tokens:
+            return False
+        return token == self.auth_tokens[client_id]
+    
+    async def process_command(self, client_id: str, data: Dict[str, Any]):
+        """Process client commands with whitelist"""
+        command = data.get('command', '').lower()
+        token = data.get('auth_token', '')
+        
+        # Verify authentication
+        if not self.verify_auth(client_id, token):
+            await self.clients[client_id]['ws'].send(json.dumps({
+                'type': 'error',
+                'code': 'UNAUTHORIZED',
+                'message': 'Invalid authentication token'
+            }))
+            return
+        
+        # Mark as authenticated
+        self.clients[client_id]['authenticated'] = True
+        
+        # Check command whitelist
+        if command not in self.allowed_commands:
+            await self.clients[client_id]['ws'].send(json.dumps({
+                'type': 'error',
+                'code': 'INVALID_COMMAND',
+                'message': f'Command {command} not allowed'
+            }))
+            return
+        
+        self.clients[client_id]['last_event'] = command.upper()
+        
+        if command == 'stats':
+            await self.handle_stats(client_id, data)
+        elif command == 'ping':
+            await self.handle_ping(client_id)
+        elif command == 'sync':
+            await self.handle_sync(client_id)
+        elif command == 'notify':
+            await self.handle_notify(client_id, data)
+        elif command == 'status':
+            await self.handle_status(client_id)
+    
+    async def handle_stats(self, client_id: str, data: Dict[str, Any]):
+        """Handle telemetry stats"""
+        ping = data.get('ping', 0)
+        fps = data.get('fps', 0)
+        rtt = data.get('rtt', 0)
+        client_uptime = data.get('uptime', 'N/A')
+        memory = data.get('memory', 'N/A')
+        
+        self.clients[client_id]['ping'] = ping
+        self.clients[client_id]['fps'] = fps
+        self.clients[client_id]['rtt'] = rtt
+        self.clients[client_id]['client_uptime'] = client_uptime
+        self.clients[client_id]['memory'] = memory
+        
+        # Store history
+        self.clients[client_id]['ping_history'].append(ping)
+        self.clients[client_id]['fps_history'].append(fps)
+        
+        avg_ping = sum(self.clients[client_id]['ping_history']) / len(self.clients[client_id]['ping_history']) if self.clients[client_id]['ping_history'] else 0
+        avg_fps = sum(self.clients[client_id]['fps_history']) / len(self.clients[client_id]['fps_history']) if self.clients[client_id]['fps_history'] else 0
+        
+        self.log_activity(
+            f"{self.C['green']}[STATS]{self.C['reset']}  {client_id} - "
+            f"Ping: {ping:.1f}ms | FPS: {fps:.0f} | RTT: {rtt:.1f}ms | "
+            f"Avg Ping: {avg_ping:.1f}ms | Avg FPS: {avg_fps:.0f}"
+        )
+        
+        await self.clients[client_id]['ws'].send(json.dumps({
+            'type': 'stats_ack',
+            'received': True,
+            'timestamp': datetime.now().isoformat()
+        }))
+    
+    async def handle_ping(self, client_id: str):
+        """Handle ping request"""
+        await self.clients[client_id]['ws'].send(json.dumps({
+            'type': 'pong',
+            'timestamp': datetime.now().isoformat()
+        }))
+        self.log_activity(f"{self.C['blue']}[PING]{self.C['reset']}   Ping from {client_id}")
+    
+    async def handle_sync(self, client_id: str):
+        """Handle sync request"""
+        await self.clients[client_id]['ws'].send(json.dumps({
+            'type': 'sync_ack',
+            'session': self.session_id,
+            'timestamp': datetime.now().isoformat()
+        }))
+        self.log_activity(f"{self.C['blue']}[SYNC]{self.C['reset']}    Client {client_id} synchronized")
+    
+    async def handle_notify(self, client_id: str, data: Dict[str, Any]):
+        """Handle notification from client"""
+        message = data.get('message', '')
+        self.log_activity(f"{self.C['magenta']}[NOTIFY]{self.C['reset']} {client_id}: {message}")
+        
+        await self.clients[client_id]['ws'].send(json.dumps({
+            'type': 'notify_ack',
+            'received': True,
+            'timestamp': datetime.now().isoformat()
+        }))
+    
+    async def handle_status(self, client_id: str):
+        """Handle status request"""
+        info = {
+            'connected': True,
+            'session': self.session_id,
+            'client_id': client_id,
+            'uptime': str(datetime.now() - self.start_time).split('.')[0],
+            'clients': len(self.clients)
+        }
+        await self.clients[client_id]['ws'].send(json.dumps({
+            'type': 'status_response',
+            'data': info,
+            'timestamp': datetime.now().isoformat()
+        }))
+    
+    async def send_notification(self, message: str):
+        """Send notification to all clients"""
+        if not self.clients:
+            self.log_activity(f"{self.C['yellow']}[WARN]{self.C['reset']}   No clients to notify")
+            return 0
+        
+        payload = {
+            'type': 'notification',
+            'message': message,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        success = 0
+        for client_id, client_data in self.clients.items():
+            try:
+                await client_data['ws'].send(json.dumps(payload))
+                success += 1
+            except Exception as e:
+                self.log_activity(f"{self.C['red']}[ERR]{self.C['reset']}    Failed to notify {client_id}: {e}")
+        
+        self.log_activity(f"{self.C['green']}[NOTIFY]{self.C['reset']} Sent to {success} clients")
+        return success
+    
+    def console_interface(self, loop: asyncio.AbstractEventLoop):
+        """Console interface running in separate thread"""
+        while self.running:
+            try:
+                self.print_terminal_prompt()
+                cmd = input().strip()
+                
+                if not cmd:
+                    continue
+                
+                self.command_history.append(cmd)
+                
+                if cmd == 'help':
+                    self.print_help()
+                    
+                elif cmd == 'clear':
+                    self.clear_screen()
+                    self.print_banner()
+                    self.print_status_panel()
+                    self.print_client_info()
+                    self.print_activity_log()
+                    
+                elif cmd == 'clients':
+                    if not self.clients:
+                        print(f"{self.C['yellow']}[!] No clients connected{self.C['reset']}")
+                    else:
+                        print(f"\n{self.C['cyan']}[+] Connected Clients:{self.C['reset']}")
+                        for client_id, client_data in self.clients.items():
+                            auth_status = f"{self.C['green']}✓{self.C['reset']}" if client_data.get('authenticated') else f"{self.C['red']}✗{self.C['reset']}"
+                            ping = client_data.get('ping', 0)
+                            fps = client_data.get('fps', 0)
+                            print(f"  {self.C['green']}●{self.C['reset']} {client_id} [{auth_status}]")
+                            print(f"    Ping: {ping:.1f}ms | FPS: {fps:.0f}")
+                            print(f"    IP: {client_data['ip']}")
+                            print()
+                            
+                elif cmd == 'status':
+                    self.clear_screen()
+                    self.print_banner()
+                    self.print_status_panel()
+                    self.print_client_info()
+                    self.print_activity_log()
+                    
+                elif cmd == 'stats':
+                    if not self.clients:
+                        print(f"{self.C['red']}[!] No clients connected{self.C['reset']}")
+                        continue
+                    
+                    print(f"\n{self.C['cyan']}[ TELEMETRY ]{self.C['reset']}")
+                    for client_id, client_data in self.clients.items():
+                        ping = client_data.get('ping', 0)
+                        fps = client_data.get('fps', 0)
+                        rtt = client_data.get('rtt', 0)
+                        memory = client_data.get('memory', 'N/A')
+                        uptime = client_data.get('client_uptime', 'N/A')
+                        
+                        print(f"\n  {self.C['yellow']}{client_id}{self.C['reset']}")
+                        print(f"    WebSocket RTT: {rtt:.1f}ms")
+                        print(f"    Game Ping:     {ping:.1f}ms")
+                        print(f"    FPS:           {fps:.0f}")
+                        print(f"    Memory:        {memory}")
+                        print(f"    Uptime:        {uptime}")
+                    
+                elif cmd.startswith('notify '):
+                    message = cmd[7:]
+                    if message:
+                        count = asyncio.run_coroutine_threadsafe(
+                            self.send_notification(message),
+                            loop
+                        ).result()
+                        print(f"{self.C['green']}[+] Notification sent to {count} clients{self.C['reset']}")
+                    else:
+                        print(f"{self.C['red']}[!] No message provided{self.C['reset']}")
+                    
+                elif cmd == 'logs':
+                    print(f"\n{self.C['cyan']}[ ACTIVITY LOGS ]{self.C['reset']}")
+                    for log in self.activity_logs:
+                        print(f"  {log}")
+                        
+                elif cmd == 'session':
+                    print(f"""
+{self.C['cyan']}[ SESSION INFO ]{self.C['reset']}
+  Session ID  : {self.C['yellow']}{self.session_id}{self.C['reset']}
+  Start Time  : {self.C['green']}{self.start_time.strftime('%Y-%m-%d %H:%M:%S')}{self.C['reset']}
+  Uptime      : {self.C['green']}{str(datetime.now() - self.start_time).split('.')[0]}{self.C['reset']}
+  Clients     : {self.C['yellow']}{len(self.clients)}{self.C['reset']}
+  Auth Tokens : {self.C['yellow']}{len(self.valid_tokens)}{self.C['reset']}
+  Rate Limit  : {self.C['green']}{self.max_requests_per_minute}/min{self.C['reset']}""")
+                    
+                elif cmd == 'exit':
+                    self.running = False
+                    print(f"{self.C['red']}[!] Shutting down...{self.C['reset']}")
+                    break
+                    
+                else:
+                    print(f"{self.C['red']}[!] Unknown command: {cmd}{self.C['reset']}")
+                    print(f"{self.C['yellow']}Type 'help' for available commands{self.C['reset']}")
+                    
+            except KeyboardInterrupt:
+                self.running = False
+                print(f"\n{self.C['red']}[!] Shutting down...{self.C['reset']}")
+                break
+            except Exception as e:
+                print(f"{self.C['red']}[!] Error: {e}{self.C['reset']}")
+
+    async def start_server(self, host='0.0.0.0', port=8765):
+        self.loop = asyncio.get_running_loop()
+        
+        self.clear_screen()
+        self.print_banner()
+        self.print_status_panel()
+        self.print_client_info()
+        self.print_activity_log()
+        
+        print(f"\n{self.C['green']}[+] Secure Neural Console Server started!{self.C['reset']}")
+        print(f"{self.C['cyan']}[+] Listening on {host}:{port}{self.C['reset']}")
+        print(f"{self.C['yellow']}[+] Session: {self.session_id}{self.C['reset']}")
+        print(f"{self.C['green']}[+] Command Whitelist: {', '.join(self.allowed_commands)}{self.C['reset']}")
+        print(f"{self.C['green']}[+] Rate Limit: {self.max_requests_per_minute} req/min{self.C['reset']}")
+        
+        console_thread = threading.Thread(
+            target=self.console_interface,
+            args=(self.loop,),
+            daemon=True
+        )
+        console_thread.start()
+        
+        async with serve(self.handle_client, host, port):
+            self.log_activity(f"{self.C['green']}[SRV]{self.C['reset']}     Server started on {host}:{port}")
+            
+            try:
+                while self.running:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                self.running = False
+                print(f"\n{self.C['red']}[!] Shutting down...{self.C['reset']}")
+            finally:
+                for client_id in list(self.clients.keys()):
+                    try:
+                        await self.clients[client_id]['ws'].close()
+                    except:
+                        pass
+                self.clients.clear()
+
+def main():
+    console = SecureNeuralConsole()
+    
+    def signal_handler(sig, frame):
+        console.running = False
+        print(f"\n{console.C['red']}[!] Server stopped{console.C['reset']}")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        asyncio.run(console.start_server())
+    except KeyboardInterrupt:
+        console.running = False
+        print(f"\n{console.C['red']}[!] Server stopped{console.C['reset']}")
+    except Exception as e:
+        print(f"{console.C['red']}[!] Fatal error: {e}{console.C['reset']}")
+
+if __name__ == "__main__":
+    main()
