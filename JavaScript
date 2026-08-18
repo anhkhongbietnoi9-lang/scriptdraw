@@ -1,0 +1,121 @@
+const morph = document.getElementById('morph');
+const closeBtn = document.getElementById('close-btn');
+const pagesSlider = document.getElementById('pages-slider');
+
+let state = 'initial';
+
+morph.addEventListener('click', (e) => {
+    if (state !== 'initial') return;
+
+    state = 'open';
+    morph.classList.remove('initial');
+    morph.classList.add('open');
+
+    document.getElementById('login-form').reset();
+    document.getElementById('create-form').reset();
+    document.getElementById('login-msg').style.display = 'none';
+    document.getElementById('create-msg').style.display = 'none';
+    pagesSlider.classList.remove('show-create');
+});
+
+function closeMorph(e) {
+    if (e) e.stopPropagation();
+    if (state === 'closing' || state === 'shrinking' || state === 'initial') return;
+
+    state = 'closing';
+
+    morph.classList.add('closing-1');
+
+    setTimeout(() => {
+        morph.classList.add('closing-2');
+
+        setTimeout(() => {
+            morph.classList.remove('open', 'closing-1', 'closing-2');
+            morph.classList.add('shrinking');
+
+            setTimeout(() => {
+                morph.classList.remove('shrinking');
+                state = 'initial';
+            }, 600);
+
+        }, 400 + 200);
+
+    }, 300);
+}
+
+closeBtn.addEventListener('click', closeMorph);
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && state === 'open') closeMorph();
+});
+
+document.querySelector('.ui-container').addEventListener('click', (e) => {
+    e.stopPropagation();
+});
+
+document.getElementById('go-to-create').addEventListener('click', (e) => {
+    e.preventDefault();
+    pagesSlider.classList.add('show-create');
+});
+
+document.getElementById('go-to-login').addEventListener('click', (e) => {
+    e.preventDefault();
+    pagesSlider.classList.remove('show-create');
+});
+
+function showMsg(id, text, isSuccess) {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.className = 'msg-box ' + (isSuccess ? 'success' : 'error');
+    el.style.display = 'block';
+}
+
+document.getElementById('login-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+
+    const u = document.getElementById('login-username').value.trim();
+    const p = document.getElementById('login-password').value.trim();
+
+    if (!u || !p) {
+        showMsg(
+            'login-msg',
+            'Vui lòng nhập username và password.',
+            false
+        );
+    } else {
+        showMsg(
+            'login-msg',
+            'Demo Login Username: ' + u,
+            true
+        );
+    }
+});
+
+document.getElementById('create-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+
+    const u = document.getElementById('create-username').value.trim();
+    const em = document.getElementById('create-email').value.trim();
+    const p = document.getElementById('create-password').value;
+    const c = document.getElementById('create-confirm').value;
+
+    if (!u || !em || !p || !c) {
+        showMsg(
+            'create-msg',
+            'Vui lòng điền đầy đủ thông tin.',
+            false
+        );
+    } else if (p !== c) {
+        showMsg(
+            'create-msg',
+            'Password xác nhận không khớp.',
+            false
+        );
+    } else {
+        showMsg(
+            'create-msg',
+            `Demo Create Account Username: ${u} Email: ${em}`,
+            true
+        );
+    }
+});
