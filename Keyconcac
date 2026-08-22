@@ -1,0 +1,1406 @@
+#!/usr/bin/env python3
+
+"""
+MC CUSTOM CIPHER
+================
+
+Một chương trình mã hóa / giải mã chạy trực tiếp trong Termux.
+
+Điều khiển:
+
+    Ctrl + U
+        Mã hóa nội dung hiện tại.
+
+    Ctrl + B
+        Giải mã nội dung hiện tại.
+
+    Ctrl + R
+        Thoát khỏi chương trình.
+
+    Enter
+        Xuống dòng.
+
+    Backspace
+        Xóa ký tự cuối.
+
+    Ctrl + C
+        Thoát an toàn.
+
+Đặc điểm:
+
+    - Không dùng thư viện bên ngoài.
+    - Dùng termios / tty của Python trên Unix.
+    - Hỗ trợ UTF-8.
+    - Hỗ trợ văn bản nhiều dòng.
+    - Có key.
+    - Có kiểm tra tính hợp lệ của key.
+    - Có kiểm tra dữ liệu sau giải mã.
+    - Có giao diện terminal.
+    - Tự khôi phục trạng thái terminal khi thoát.
+"""
+
+import sys
+import os
+import tty
+import termios
+import getpass
+import hashlib
+import hmac
+import secrets
+import base64
+
+
+# ============================================================
+# CẤU HÌNH
+# ============================================================
+
+PROGRAM_NAME = "MC CUSTOM CIPHER"
+
+VERSION = "2.0"
+
+HEADER = "MCX2."
+
+KEY_DERIVATION_ROUNDS = 120_000
+
+SALT_SIZE = 16
+
+NONCE_SIZE = 16
+
+TAG_SIZE = 32
+
+KEY_SIZE = 32
+
+
+# ============================================================
+# ANSI TERMINAL
+# ============================================================
+
+ANSI_RESET = "\033[0m"
+
+ANSI_BOLD = "\033[1m"
+
+ANSI_DIM = "\033[2m"
+
+ANSI_CYAN = "\033[96m"
+
+ANSI_BLUE = "\033[94m"
+
+ANSI_GREEN = "\033[92m"
+
+ANSI_YELLOW = "\033[93m"
+
+ANSI_RED = "\033[91m"
+
+ANSI_WHITE = "\033[97m"
+
+ANSI_GRAY = "\033[90m"
+
+ANSI_CLEAR_SCREEN = "\033[2J"
+
+ANSI_CURSOR_HOME = "\033[H"
+
+ANSI_CURSOR_HIDE = "\033[?25l"
+
+ANSI_CURSOR_SHOW = "\033[?25h"
+
+ANSI_CLEAR_LINE = "\033[2K"
+
+ANSI_CURSOR_LEFT = "\033[D"
+
+ANSI_CURSOR_RIGHT = "\033[C"
+
+
+# ============================================================
+# HÀM IN AN TOÀN
+# ============================================================
+
+def terminal_write(text):
+    """
+    Ghi trực tiếp ra terminal.
+
+    Используем flush для немедленного вывода.
+    """
+
+    sys.stdout.write(text)
+
+    sys.stdout.flush()
+
+
+def terminal_clear():
+    """
+    Xóa toàn bộ terminal và đưa con trỏ về đầu.
+    """
+
+    terminal_write(
+        ANSI_CLEAR_SCREEN +
+        ANSI_CURSOR_HOME
+    )
+
+
+def terminal_hide_cursor():
+    """
+    Ẩn con trỏ.
+    """
+
+    terminal_write(
+        ANSI_CURSOR_HIDE
+    )
+
+
+def terminal_show_cursor():
+    """
+    Hiện lại con trỏ.
+    """
+
+    terminal_write(
+        ANSI_CURSOR_SHOW
+    )
+
+
+# ============================================================
+# TRẠNG THÁI TERMINAL
+# ============================================================
+
+class TerminalState:
+    """
+    Quản lý trạng thái terminal.
+
+    Сохраняем исходные настройки терминала,
+    чтобы после завершения программы восстановить их.
+    """
+
+    def __init__(self):
+
+        self.file_descriptor = sys.stdin.fileno()
+
+        self.original_attributes = None
+
+        self.is_active = False
+
+    def enter(self):
+
+        if self.is_active:
+            return
+
+        self.original_attributes = (
+            termios.tcgetattr(
+                self.file_descriptor
+            )
+        )
+
+        tty.setcbreak(
+            self.file_descriptor
+        )
+
+        self.is_active = True
+
+    def restore(self):
+
+        if not self.is_active:
+            return
+
+        if self.original_attributes is not None:
+
+            termios.tcsetattr(
+                self.file_descriptor,
+                termios.TCSADRAIN,
+                self.original_attributes
+            )
+
+        self.is_active = False
+
+    def __enter__(self):
+
+        self.enter()
+
+        return self
+
+    def __exit__(
+        self,
+        exception_type,
+        exception_value,
+        traceback
+    ):
+
+        self.restore()
+
+
+# ============================================================
+# KEY
+# ============================================================
+
+def derive_key(password, salt):
+    """
+    Tạo khóa nhị phân từ key người dùng.
+
+    Sử dụng PBKDF2-HMAC-SHA256.
+    """
+
+    password_bytes = password.encode(
+        "utf-8"
+    )
+
+    derived_key = hashlib.pbkdf2_hmac(
+        "sha256",
+        password_bytes,
+        salt,
+        KEY_DERIVATION_ROUNDS,
+        dklen=KEY_SIZE
+    )
+
+    return derived_key
+
+
+# ============================================================
+# STREAM KEY
+# ============================================================
+
+def generate_keystream(key, nonce, length):
+    """
+    Tạo chuỗi byte dùng để XOR.
+
+    Đây là phần cấu trúc tự thiết kế của MCX2.
+
+    Lưu ý:
+
+        Đây không phải stream cipher tiêu chuẩn.
+        Nó chỉ phục vụ cho định dạng tự chế này.
+    """
+
+    result = bytearray()
+
+    counter = 0
+
+    while len(result) < length:
+
+        counter_bytes = counter.to_bytes(
+            8,
+            byteorder="big"
+        )
+
+        block = hashlib.blake2s(
+            key=key,
+            digest_size=32,
+            person=b"MCX2STREAM",
+            salt=nonce
+        ).copy()
+
+        block.update(counter_bytes)
+
+        result.extend(
+            block.digest()
+        )
+
+        counter += 1
+
+    return bytes(
+        result[:length]
+    )
+
+
+# ============================================================
+# XOR
+# ============================================================
+
+def xor_bytes(data, keystream):
+    """
+    XOR dữ liệu với keystream.
+    """
+
+    result = bytearray(
+        len(data)
+    )
+
+    for index in range(len(data)):
+
+        result[index] = (
+            data[index] ^
+            keystream[index]
+        )
+
+    return bytes(result)
+
+
+# ============================================================
+# AUTH TAG
+# ============================================================
+
+def create_authentication_tag(
+    key,
+    salt,
+    nonce,
+    ciphertext
+):
+    """
+    Tạo tag kiểm tra dữ liệu.
+
+    HMAC-SHA256 giúp phát hiện:
+
+        - sai key
+        - dữ liệu bị sửa
+        - mã bị thiếu
+        - mã bị hỏng
+    """
+
+    message = (
+        b"MCX2|" +
+        salt +
+        nonce +
+        ciphertext
+    )
+
+    return hmac.new(
+        key,
+        message,
+        hashlib.sha256
+    ).digest()
+
+
+# ============================================================
+# MÃ HÓA
+# ============================================================
+
+def encrypt_text(text, password):
+    """
+    Mã hóa văn bản thành chuỗi MCX2.
+    """
+
+    if password == "":
+        raise ValueError(
+            "Key không được để trống."
+        )
+
+    plaintext = text.encode(
+        "utf-8"
+    )
+
+    salt = secrets.token_bytes(
+        SALT_SIZE
+    )
+
+    nonce = secrets.token_bytes(
+        NONCE_SIZE
+    )
+
+    key = derive_key(
+        password,
+        salt
+    )
+
+    keystream = generate_keystream(
+        key,
+        nonce,
+        len(plaintext)
+    )
+
+    ciphertext = xor_bytes(
+        plaintext,
+        keystream
+    )
+
+    tag = create_authentication_tag(
+        key,
+        salt,
+        nonce,
+        ciphertext
+    )
+
+    payload = (
+        salt +
+        nonce +
+        ciphertext +
+        tag
+    )
+
+    encoded = base64.urlsafe_b64encode(
+        payload
+    ).decode(
+        "ascii"
+    ).rstrip("=")
+
+    return HEADER + encoded
+
+
+# ============================================================
+# GIẢI MÃ
+# ============================================================
+
+def decrypt_text(encoded_text, password):
+    """
+    Giải mã chuỗi MCX2.
+    """
+
+    if password == "":
+        raise ValueError(
+            "Key không được để trống."
+        )
+
+    if not encoded_text.startswith(
+        HEADER
+    ):
+        raise ValueError(
+            "Dữ liệu không bắt đầu bằng MCX2."
+        )
+
+    encoded_payload = (
+        encoded_text[
+            len(HEADER):
+        ]
+        .strip()
+    )
+
+    padding_length = (
+        4 -
+        len(encoded_payload) % 4
+    ) % 4
+
+    encoded_payload += (
+        "=" * padding_length
+    )
+
+    try:
+
+        payload = (
+            base64.urlsafe_b64decode(
+                encoded_payload
+            )
+        )
+
+    except Exception as error:
+
+        raise ValueError(
+            "Chuỗi MCX2 bị hỏng."
+        ) from error
+
+    minimum_size = (
+        SALT_SIZE +
+        NONCE_SIZE +
+        TAG_SIZE
+    )
+
+    if len(payload) < minimum_size:
+
+        raise ValueError(
+            "Dữ liệu MCX2 quá ngắn."
+        )
+
+    salt = payload[
+        0:SALT_SIZE
+    ]
+
+    nonce_start = SALT_SIZE
+
+    nonce_end = (
+        nonce_start +
+        NONCE_SIZE
+    )
+
+    nonce = payload[
+        nonce_start:nonce_end
+    ]
+
+    tag_start = len(payload) - TAG_SIZE
+
+    ciphertext = payload[
+        nonce_end:tag_start
+    ]
+
+    received_tag = payload[
+        tag_start:
+    ]
+
+    key = derive_key(
+        password,
+        salt
+    )
+
+    expected_tag = (
+        create_authentication_tag(
+            key,
+            salt,
+            nonce,
+            ciphertext
+        )
+    )
+
+    if not hmac.compare_digest(
+        received_tag,
+        expected_tag
+    ):
+
+        raise ValueError(
+            "Sai key hoặc dữ liệu đã bị thay đổi."
+        )
+
+    keystream = generate_keystream(
+        key,
+        nonce,
+        len(ciphertext)
+    )
+
+    plaintext = xor_bytes(
+        ciphertext,
+        keystream
+    )
+
+    try:
+
+        return plaintext.decode(
+            "utf-8"
+        )
+
+    except UnicodeDecodeError as error:
+
+        raise ValueError(
+            "Dữ liệu giải mã không phải UTF-8 hợp lệ."
+        ) from error
+
+
+# ============================================================
+# NHẬP KEY
+# ============================================================
+
+def ask_for_key():
+    """
+    Nhập key bằng getpass để không hiện key trên màn hình.
+    """
+
+    terminal_show_cursor()
+
+    print()
+
+    print(
+        ANSI_CYAN +
+        "KEY" +
+        ANSI_RESET
+    )
+
+    print(
+        ANSI_DIM +
+        "Key sẽ không được hiển thị." +
+        ANSI_RESET
+    )
+
+    password = getpass.getpass(
+        "Nhập KEY: "
+    )
+
+    if password == "":
+
+        raise ValueError(
+            "Key không được để trống."
+        )
+
+    return password
+
+
+# ============================================================
+# BỘ NHẬP VĂN BẢN
+# ============================================================
+
+class TextEditor:
+    """
+    Bộ nhập văn bản nhiều dòng.
+
+    Các phím:
+
+        Enter
+            Xuống dòng.
+
+        Backspace
+            Xóa ký tự cuối.
+
+        Ctrl+U
+            Yêu cầu mã hóa.
+
+        Ctrl+B
+            Yêu cầu giải mã.
+
+        Ctrl+R
+            Thoát.
+
+        Ctrl+C
+            Thoát an toàn.
+    """
+
+    CTRL_U = 21
+
+    CTRL_B = 2
+
+    CTRL_R = 18
+
+    CTRL_C = 3
+
+    BACKSPACE = 127
+
+    BACKSPACE_ALT = 8
+
+    ENTER = 13
+
+    LINE_FEED = 10
+
+    def __init__(self):
+
+        self.buffer = []
+
+        self.cursor_position = 0
+
+    def get_text(self):
+
+        return "".join(
+            self.buffer
+        )
+
+    def set_text(self, text):
+
+        self.buffer = list(
+            text
+        )
+
+        self.cursor_position = len(
+            self.buffer
+        )
+
+    def append_character(self, character):
+
+        self.buffer.insert(
+            self.cursor_position,
+            character
+        )
+
+        self.cursor_position += 1
+
+    def backspace(self):
+
+        if self.cursor_position <= 0:
+            return
+
+        self.cursor_position -= 1
+
+        del self.buffer[
+            self.cursor_position
+        ]
+
+    def move_left(self):
+
+        if self.cursor_position > 0:
+
+            self.cursor_position -= 1
+
+    def move_right(self):
+
+        if (
+            self.cursor_position
+            < len(self.buffer)
+        ):
+
+            self.cursor_position += 1
+
+    def clear(self):
+
+        self.buffer.clear()
+
+        self.cursor_position = 0
+
+
+# ============================================================
+# GIAO DIỆN
+# ============================================================
+
+class UserInterface:
+
+    def __init__(self):
+
+        self.status_text = "READY"
+
+        self.status_type = "normal"
+
+    def set_status(
+        self,
+        message,
+        status_type="normal"
+    ):
+
+        self.status_text = message
+
+        self.status_type = (
+            status_type
+        )
+
+    def draw_header(self):
+
+        terminal_clear()
+
+        print(
+            ANSI_CYAN +
+            ANSI_BOLD +
+            "╭────────────────────────────────────────────────────────────╮" +
+            ANSI_RESET
+        )
+
+        print(
+            ANSI_CYAN +
+            ANSI_BOLD +
+            "│" +
+            ANSI_RESET +
+            "                  MC CUSTOM CIPHER                       " +
+            ANSI_CYAN +
+            ANSI_BOLD +
+            "│" +
+            ANSI_RESET
+        )
+
+        print(
+            ANSI_CYAN +
+            "│" +
+            ANSI_RESET +
+            "                  TERMINAL EDITOR                        " +
+            ANSI_CYAN +
+            "│" +
+            ANSI_RESET
+        )
+
+        print(
+            ANSI_CYAN +
+            "├────────────────────────────────────────────────────────────┤" +
+            ANSI_RESET
+        )
+
+    def draw_help(self):
+
+        print(
+            ANSI_GRAY +
+            "│ " +
+            ANSI_RESET +
+            "Ctrl+U  Mã hóa    "
+            "Ctrl+B  Giải mã    "
+            "Ctrl+R  Thoát" +
+            ANSI_GRAY +
+            "                    │" +
+            ANSI_RESET
+        )
+
+        print(
+            ANSI_GRAY +
+            "│ " +
+            ANSI_RESET +
+            "Enter xuống dòng    "
+            "Backspace xóa ký tự" +
+            ANSI_GRAY +
+            "                    │" +
+            ANSI_RESET
+        )
+
+        print(
+            ANSI_CYAN +
+            "├────────────────────────────────────────────────────────────┤" +
+            ANSI_RESET
+        )
+
+    def get_status_color(self):
+
+        if self.status_type == "success":
+
+            return ANSI_GREEN
+
+        if self.status_type == "error":
+
+            return ANSI_RED
+
+        if self.status_type == "warning":
+
+            return ANSI_YELLOW
+
+        return ANSI_WHITE
+
+    def draw_status(
+        self,
+        text,
+        key,
+        mode
+    ):
+
+        color = self.get_status_color()
+
+        character_count = len(text)
+
+        byte_count = len(
+            text.encode(
+                "utf-8"
+            )
+        )
+
+        key_mask = (
+            "*" * len(key)
+        )
+
+        print(
+            ANSI_CYAN +
+            "│ " +
+            ANSI_RESET +
+            f"KEY    : {key_mask}" +
+            "\n"
+        )
+
+        print(
+            ANSI_CYAN +
+            "│ " +
+            ANSI_RESET +
+            f"MODE   : {mode}"
+        )
+
+        print()
+
+        print(
+            ANSI_CYAN +
+            "│ " +
+            ANSI_RESET +
+            f"CHARS  : {character_count}"
+        )
+
+        print()
+
+        print(
+            ANSI_CYAN +
+            "│ " +
+            ANSI_RESET +
+            f"BYTES  : {byte_count}"
+        )
+
+        print()
+
+        print(
+            ANSI_CYAN +
+            "│ " +
+            ANSI_RESET +
+            "STATUS : " +
+            color +
+            self.status_text +
+            ANSI_RESET
+        )
+
+        print()
+
+        print(
+            ANSI_CYAN +
+            "╰────────────────────────────────────────────────────────────╯" +
+            ANSI_RESET
+        )
+
+
+# ============================================================
+# VẼ EDITOR
+# ============================================================
+
+def render_editor(
+    user_interface,
+    editor,
+    key,
+    mode
+):
+    """
+    Vẽ lại giao diện.
+
+    Không cố làm giao diện màu mè.
+    Chỉ hiển thị thông tin thực sự hữu ích.
+    """
+
+    user_interface.draw_header()
+
+    user_interface.draw_help()
+
+    text = editor.get_text()
+
+    lines = text.split(
+        "\n"
+    )
+
+    print(
+        ANSI_CYAN +
+        "│ " +
+        ANSI_RESET +
+        "NỘI DUNG" 
+    )
+
+    print(
+        ANSI_CYAN +
+        "│ " +
+        ANSI_RESET +
+        "────────────────────────────────────────────────────────────"
+    )
+
+    if not lines:
+
+        print(
+            ANSI_GRAY +
+            "│ " +
+            ANSI_RESET +
+            "..."
+        )
+
+    else:
+
+        for line_index, line in enumerate(
+            lines,
+            start=1
+        ):
+
+            print(
+                ANSI_CYAN +
+                "│ " +
+                ANSI_RESET +
+                f"{line_index:03d} │ {line}"
+            )
+
+    print(
+        ANSI_CYAN +
+        "├────────────────────────────────────────────────────────────┤" +
+        ANSI_RESET
+    )
+
+    user_interface.draw_status(
+        text,
+        key,
+        mode
+    )
+
+
+# ============================================================
+# NHẬN PHÍM
+# ============================================================
+
+def read_character():
+    """
+    Đọc một ký tự từ terminal.
+
+    tty cbreak cho phép chương trình nhận phím
+    mà không cần chờ Enter.
+    """
+
+    character = sys.stdin.read(
+        1
+    )
+
+    return character
+
+
+# ============================================================
+# CHỜ PHÍM
+# ============================================================
+
+def input_loop(
+    editor,
+    user_interface,
+    key
+):
+    """
+    Vòng lặp chính.
+
+    Trả về:
+
+        "encrypt"
+        "decrypt"
+        "exit"
+    """
+
+    with TerminalState():
+
+        terminal_hide_cursor()
+
+        render_editor(
+            user_interface,
+            editor,
+            key,
+            "INPUT"
+        )
+
+        while True:
+
+            character = read_character()
+
+            if character == "":
+
+                return "exit"
+
+            code = ord(
+                character
+            )
+
+            # ------------------------------------------------
+            # CTRL + R
+            # ------------------------------------------------
+
+            if code == TextEditor.CTRL_R:
+
+                return "exit"
+
+            # ------------------------------------------------
+            # CTRL + C
+            # ------------------------------------------------
+
+            if code == TextEditor.CTRL_C:
+
+                return "exit"
+
+            # ------------------------------------------------
+            # CTRL + U
+            # ------------------------------------------------
+
+            if code == TextEditor.CTRL_U:
+
+                return "encrypt"
+
+            # ------------------------------------------------
+            # CTRL + B
+            # ------------------------------------------------
+
+            if code == TextEditor.CTRL_B:
+
+                return "decrypt"
+
+            # ------------------------------------------------
+            # BACKSPACE
+            # ------------------------------------------------
+
+            if (
+                code ==
+                TextEditor.BACKSPACE
+                or
+                code ==
+                TextEditor.BACKSPACE_ALT
+            ):
+
+                editor.backspace()
+
+                render_editor(
+                    user_interface,
+                    editor,
+                    key,
+                    "INPUT"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # ENTER
+            # ------------------------------------------------
+
+            if (
+                code ==
+                TextEditor.ENTER
+                or
+                code ==
+                TextEditor.LINE_FEED
+            ):
+
+                editor.append_character(
+                    "\n"
+                )
+
+                render_editor(
+                    user_interface,
+                    editor,
+                    key,
+                    "INPUT"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # KÝ TỰ BÌNH THƯỜNG
+            # ------------------------------------------------
+
+            if (
+                character.isprintable()
+                or
+                code >= 128
+            ):
+
+                editor.append_character(
+                    character
+                )
+
+                render_editor(
+                    user_interface,
+                    editor,
+                    key,
+                    "INPUT"
+                )
+
+
+# ============================================================
+# CHẠY MỘT PHIÊN
+# ============================================================
+
+def process_session(
+    key
+):
+    """
+    Chạy một phiên nhập / mã hóa / giải mã.
+    """
+
+    editor = TextEditor()
+
+    interface = UserInterface()
+
+    action = input_loop(
+        editor,
+        interface,
+        key
+    )
+
+    if action == "exit":
+
+        return (
+            False,
+            ""
+        )
+
+    text = editor.get_text()
+
+    if text == "":
+
+        terminal_show_cursor()
+
+        print()
+
+        print(
+            ANSI_YELLOW +
+            "Không có nội dung." +
+            ANSI_RESET
+        )
+
+        return (
+            True,
+            ""
+        )
+
+    try:
+
+        if action == "encrypt":
+
+            result = encrypt_text(
+                text,
+                key
+            )
+
+            terminal_show_cursor()
+
+            print()
+
+            print(
+                ANSI_GREEN +
+                ANSI_BOLD +
+                "══════════════ MÃ HÓA ══════════════" +
+                ANSI_RESET
+            )
+
+            print()
+
+            print(result)
+
+            print()
+
+            print(
+                ANSI_GREEN +
+                "═════════════════════════════════════" +
+                ANSI_RESET
+            )
+
+            print()
+
+            return (
+                True,
+                result
+            )
+
+        if action == "decrypt":
+
+            result = decrypt_text(
+                text,
+                key
+            )
+
+            terminal_show_cursor()
+
+            print()
+
+            print(
+                ANSI_GREEN +
+                ANSI_BOLD +
+                "══════════════ GIẢI MÃ ══════════════" +
+                ANSI_RESET
+            )
+
+            print()
+
+            print(result)
+
+            print()
+
+            print(
+                ANSI_GREEN +
+                "═════════════════════════════════════" +
+                ANSI_RESET
+            )
+
+            print()
+
+            return (
+                True,
+                result
+            )
+
+    except Exception as error:
+
+        terminal_show_cursor()
+
+        print()
+
+        print(
+            ANSI_RED +
+            "LỖI: " +
+            ANSI_RESET +
+            str(error)
+        )
+
+        print()
+
+        return (
+            True,
+            ""
+        )
+
+    return (
+        True,
+        ""
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    try:
+
+        terminal_clear()
+
+        terminal_show_cursor()
+
+        print(
+            ANSI_CYAN +
+            ANSI_BOLD +
+            "MC CUSTOM CIPHER " +
+            VERSION +
+            ANSI_RESET
+        )
+
+        print()
+
+        print(
+            ANSI_GRAY +
+            "Custom terminal cipher / UTF-8 / MCX2" +
+            ANSI_RESET
+        )
+
+        print()
+
+        key = ask_for_key()
+
+        print()
+
+        print(
+            ANSI_GREEN +
+            "Key đã được nhận." +
+            ANSI_RESET
+        )
+
+        print()
+
+        print(
+            ANSI_GRAY +
+            "Bắt đầu bộ soạn thảo..." +
+            ANSI_RESET
+        )
+
+        print()
+
+        while True:
+
+            keep_running, result = (
+                process_session(
+                    key
+                )
+            )
+
+            if not keep_running:
+
+                break
+
+            print(
+                ANSI_GRAY +
+                "Ctrl+U = mã hóa | "
+                "Ctrl+B = giải mã | "
+                "Ctrl+R = thoát" +
+                ANSI_RESET
+            )
+
+            print()
+
+            input(
+                "Nhấn Enter để quay lại..."
+            )
+
+            terminal_clear()
+
+    except KeyboardInterrupt:
+
+        pass
+
+    except EOFError:
+
+        pass
+
+    except Exception as error:
+
+        terminal_show_cursor()
+
+        print()
+
+        print(
+            ANSI_RED +
+            "Lỗi nghiêm trọng: " +
+            ANSI_RESET +
+            str(error)
+        )
+
+    finally:
+
+        terminal_show_cursor()
+
+        terminal_clear()
+
+        print(
+            ANSI_CYAN +
+            "MC CUSTOM CIPHER" +
+            ANSI_RESET
+        )
+
+        print(
+            ANSI_GREEN +
+            "Đã thoát an toàn." +
+            ANSI_RESET
+        )
+
+        print()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
