@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 SO LOGIC RECONSTRUCTOR
-- Single-file reverse engineering toolkit for Termux/Android
-- Author: (theo yêu cầu) MC_meme_edit
-- Chạy: python main.py
+Single-file reverse engineering toolkit for Termux / Android.
+
+Chạy:
+    python main.py
+
+by MC_meme_edit
 """
 
 import os
@@ -14,149 +18,286 @@ import time
 import shutil
 import socket
 import signal
-import struct
 import hashlib
 import subprocess
 import threading
-import webbrowser
 import traceback
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
+from email.parser import BytesParser
+from email.policy import default
+
 
 # ============================================================
-# CẤU HÌNH
+# CONFIG
 # ============================================================
+
 HOST = "127.0.0.1"
 PORT = 8000
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.join(BASE_DIR, "workspace")
 UPLOAD_DIR = os.path.join(WORKSPACE, "uploads")
 OUTPUT_DIR = os.path.join(WORKSPACE, "output")
-TEMP_DIR   = os.path.join(WORKSPACE, "temp")
-LOG_DIR    = os.path.join(WORKSPACE, "logs")
+LOG_DIR = os.path.join(WORKSPACE, "logs")
 
-PY_DEPS = ["capstone", "pyelftools"]
-NATIVE_DEPS = ["objdump", "readelf", "file"]
+MAX_UPLOAD_SIZE = 200 * 1024 * 1024
+
+PY_DEPS = {
+    "capstone": "capstone",
+    "elftools": "pyelftools",
+}
+
+NATIVE_DEPS = [
+    "readelf",
+    "objdump",
+    "file",
+]
+
 
 # ============================================================
-# LOGGER
+# LOGGING
 # ============================================================
-def log(msg, tag="+"):
-    print(f"[{tag}] {msg}", flush=True)
 
-def log_err(msg):
-    print(f"[!] {msg}", flush=True)
+def log(message, tag="+"):
+    print(f"[{tag}] {message}", flush=True)
+
+
+def log_error(message):
+    print(f"[!] {message}", flush=True)
+
 
 # ============================================================
-# KIỂM TRA MÔI TRƯỜNG
+# ENVIRONMENT
 # ============================================================
+
 def is_termux():
-    return "com.termux" in os.environ.get("PREFIX", "") or \
-           os.path.exists("/data/data/com.termux/files/usr")
+    prefix = os.environ.get("PREFIX", "")
+    return (
+        "com.termux" in prefix
+        or os.path.exists("/data/data/com.termux/files/usr")
+    )
+
 
 def check_python():
-    log(f"Checking Python... {sys.version.split()[0]}")
-    if sys.version_info < (3, 7):
-        log_err("Python >= 3.7 required.")
+    version = sys.version_info
+
+    log(
+        f"Python {version.major}.{version.minor}.{version.micro}"
+    )
+
+    if version < (3, 8):
+        log_error("Python >= 3.8 is required.")
         sys.exit(1)
 
-def has_cmd(cmd):
-    return shutil.which(cmd) is not None
 
-def pip_install(pkg):
-    log(f"Installing pip package: {pkg}")
-    for extra in ([], ["--user"]):
+def has_command(command):
+    return shutil.which(command) is not None
+
+
+def install_python_package(package):
+    log(f"Installing Python package: {package}")
+
+    commands = [
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            package,
+        ],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            "--user",
+            package,
+        ],
+    ]
+
+    for command in commands:
         try:
-            r = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet", *extra, pkg],
-                capture_output=True, text=True, timeout=600
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=900,
             )
-            if r.returncode == 0:
+
+            if result.returncode == 0:
                 return True
+
         except Exception:
             pass
+
     return False
 
-def apt_install(pkg):
-    log(f"Installing apt package: {pkg}")
+
+def install_termux_package(package):
+    if not is_termux():
+        return False
+
+    log(f"Installing Termux package: {package}")
+
     try:
-        r = subprocess.run(["pkg", "install", "-y", pkg],
-                           capture_output=True, text=True, timeout=900)
-        return r.returncode == 0
+        result = subprocess.run(
+            ["pkg", "install", "-y", package],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=900,
+        )
+
+        return result.returncode == 0
+
     except Exception:
         return False
 
-def check_dependencies(auto_install=True):
+
+def check_dependencies():
     log("Checking Python dependencies...")
-    missing_py = []
-    for pkg in PY_DEPS:
+
+    missing = []
+
+    for import_name, package_name in PY_DEPS.items():
         try:
-            __import__(pkg)
-            log(f"  OK: {pkg}")
+            __import__(import_name)
+            log(f"  OK: {package_name}")
+
         except ImportError:
-            missing_py.append(pkg)
-            log(f"  MISSING: {pkg}")
+            log(f"  MISSING: {package_name}")
+            missing.append(package_name)
 
-    if missing_py and auto_install:
-        for pkg in missing_py:
-            if not pip_install(pkg):
-                log_err(f"Missing dependency: {pkg}")
-                log_err(f"Please install manually: pip install {pkg}")
-                sys.exit(1)
+    for package in missing:
+        if not install_python_package(package):
+            log_error(
+                f"Cannot install {package} automatically."
+            )
+            log_error(
+                f"Run manually: pip install {package}"
+            )
+            sys.exit(1)
 
-    log("Checking native reverse-engineering tools...")
-    missing_native = [c for c in NATIVE_DEPS if not has_cmd(c)]
-    if missing_native and auto_install and is_termux():
-        # binutils cung cấp objdump + readelf
-        apt_install("binutils")
-        apt_install("file")
-        missing_native = [c for c in NATIVE_DEPS if not has_cmd(c)]
+    log("Checking native tools...")
+
+    missing_native = [
+        command
+        for command in NATIVE_DEPS
+        if not has_command(command)
+    ]
+
+    if missing_native and is_termux():
+        log("Installing missing Termux tools...")
+
+        install_termux_package("binutils")
+        install_termux_package("file")
+
+        missing_native = [
+            command
+            for command in NATIVE_DEPS
+            if not has_command(command)
+        ]
 
     if missing_native:
-        for m in missing_native:
-            log_err(f"Missing dependency: {m}")
-        log_err("Please install it before continuing (e.g. pkg install binutils file).")
+        for command in missing_native:
+            log_error(
+                f"Missing native command: {command}"
+            )
+
+        log_error(
+            "Install with: pkg install binutils file"
+        )
         sys.exit(1)
 
-def check_storage():
-    log("Checking Termux environment...")
-    if not is_termux():
-        log("  Not running on Termux (PC/dev mode). Skipping storage check.")
-        return
-    dl = "/sdcard/Download"
-    if not os.path.exists("/sdcard"):
-        log_err("Storage permission not granted.")
-        log_err("Please run: termux-setup-storage")
-    elif not os.path.exists(dl):
-        log(f"  Warning: {dl} not found (still OK).")
-    else:
-        log(f"  Download dir OK: {dl}")
 
-def check_port(port):
-    log(f"Checking port {port}...")
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def check_storage():
+    if not is_termux():
+        return
+
+    log("Checking Android storage...")
+
+    if not os.path.exists("/sdcard"):
+        log_error(
+            "Android storage permission is not available."
+        )
+        log_error(
+            "Run: termux-setup-storage"
+        )
+        return
+
+    download_dir = "/sdcard/Download"
+
+    if os.path.isdir(download_dir):
+        log(f"  Download directory: {download_dir}")
+    else:
+        log(
+            f"  Warning: {download_dir} does not exist."
+        )
+
+
+# ============================================================
+# PORT
+# ============================================================
+
+def port_available(port):
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+    )
+
     try:
-        s.bind((HOST, port))
-        s.close()
+        sock.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1,
+        )
+
+        sock.bind((HOST, port))
         return True
+
     except OSError:
-        log_err(f"Port {port} is in use.")
         return False
+
+    finally:
+        sock.close()
+
+
+def find_free_port(start_port):
+    for port in range(start_port, start_port + 100):
+        if port_available(port):
+            return port
+
+    return None
+
 
 # ============================================================
 # WORKSPACE
 # ============================================================
+
 def prepare_workspace():
-    log("Preparing workspace...")
-    for d in (WORKSPACE, UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR, LOG_DIR):
-        os.makedirs(d, exist_ok=True)
-    log(f"  Workspace: {WORKSPACE}")
+    directories = [
+        WORKSPACE,
+        UPLOAD_DIR,
+        OUTPUT_DIR,
+        LOG_DIR,
+    ]
+
+    for directory in directories:
+        os.makedirs(directory, exist_ok=True)
+
+    log(f"Workspace: {WORKSPACE}")
+
 
 # ============================================================
-# PHÂN TÍCH ELF
+# ELF ANALYZER
 # ============================================================
+
 class ELFAnalyzer:
-    """Phân tích ELF thật, KHÔNG bịa. Nếu thiếu info -> đánh dấu UNKNOWN."""
 
     ARCH_MAP = {
         "EM_386": "x86",
@@ -164,849 +305,2522 @@ class ELFAnalyzer:
         "EM_ARM": "ARM",
         "EM_AARCH64": "ARM64",
         "EM_MIPS": "MIPS",
+        "EM_MIPS_RS3_LE": "MIPS",
         "EM_RISCV": "RISC-V",
-    }
-
-    CAPSTONE_MODE = {
-        "x86":     ("CS_ARCH_X86", "CS_MODE_32"),
-        "x86_64":  ("CS_ARCH_X86", "CS_MODE_64"),
-        "ARM":     ("CS_ARCH_ARM", "CS_MODE_ARM"),
-        "ARM64":   ("CS_ARCH_ARM64", "CS_MODE_ARM"),
-        "MIPS":    ("CS_ARCH_MIPS", "CS_MODE_MIPS32"),
-        "RISC-V":  ("CS_ARCH_RISCV", "CS_MODE_RISCV64"),
     }
 
     def __init__(self, path):
         self.path = path
+
         self.elf = None
         self.arch = None
-        self.bits = 64
+        self.bits = None
         self.endian = "<"
+
         self.symbols = {}
-        self.dynsyms = {}
         self.functions = []
         self.strings = []
+
+        self.sections = []
         self.warnings = []
+
+        self.raw = b""
+
+    # --------------------------------------------------------
+    # LOAD
+    # --------------------------------------------------------
 
     def load(self):
         from elftools.elf.elffile import ELFFile
-        with open(self.path, "rb") as f:
-            self.elf = ELFFile(f)
-            e_machine = self.elf.header["e_machine"]
-            self.arch = self.ARCH_MAP.get(e_machine, None)
+
+        with open(self.path, "rb") as file:
+            self.raw = file.read()
+
+        if self.raw[:4] != b"\x7fELF":
+            raise ValueError("Invalid ELF file.")
+
+        with open(self.path, "rb") as file:
+            self.elf = ELFFile(file)
+
+            machine = self.elf.header["e_machine"]
+
+            self.arch = self.ARCH_MAP.get(machine)
+
             if self.arch is None:
-                raise ValueError(f"Unsupported architecture: {e_machine}")
+                raise ValueError(
+                    f"Unsupported architecture: {machine}"
+                )
+
             self.bits = self.elf.elfclass
-            self.endian = "<" if self.elf.little_endian else ">"
+
+            self.endian = (
+                "<"
+                if self.elf.little_endian
+                else ">"
+            )
+
+    # --------------------------------------------------------
+    # SECTIONS
+    # --------------------------------------------------------
+
+    def collect_sections(self):
+        self.sections.clear()
+
+        for section in self.elf.iter_sections():
+
+            try:
+                item = {
+                    "name": section.name,
+                    "type": section["sh_type"],
+                    "address": section["sh_addr"],
+                    "offset": section["sh_offset"],
+                    "size": section["sh_size"],
+                    "flags": section["sh_flags"],
+                }
+
+                self.sections.append(item)
+
+            except Exception:
+                continue
+
+    # --------------------------------------------------------
+    # SYMBOLS
+    # --------------------------------------------------------
 
     def collect_symbols(self):
         from elftools.elf.sections import SymbolTableSection
-        for sec in self.elf.iter_sections():
-            if isinstance(sec, SymbolTableSection):
-                for sym in sec.iter_symbols():
-                    if sym.name and sym["st_value"]:
-                        self.symbols[sym.name] = {
-                            "value": sym["st_value"],
-                            "size": sym["st_size"],
-                            "type": sym["st_info"]["type"],
-                            "bind": sym["st_info"]["bind"],
-                        }
+
+        self.symbols.clear()
+
+        for section in self.elf.iter_sections():
+
+            if not isinstance(
+                section,
+                SymbolTableSection,
+            ):
+                continue
+
+            try:
+                symbols = section.iter_symbols()
+
+                for symbol in symbols:
+
+                    name = symbol.name
+
+                    if not name:
+                        continue
+
+                    value = int(symbol["st_value"])
+                    size = int(symbol["st_size"])
+
+                    symbol_type = symbol["st_info"]["type"]
+                    bind = symbol["st_info"]["bind"]
+
+                    self.symbols[name] = {
+                        "name": name,
+                        "value": value,
+                        "size": size,
+                        "type": symbol_type,
+                        "bind": bind,
+                    }
+
+            except Exception as error:
+                self.warnings.append(
+                    f"Symbol table read error: {error}"
+                )
+
         if not self.symbols:
             self.warnings.append(
-                "Warning: Symbols are stripped. "
-                "Function and variable names may be unavailable."
+                "No symbols found. "
+                "The binary may be stripped."
             )
 
-    def collect_strings(self, min_len=5):
-        with open(self.path, "rb") as f:
-            data = f.read()
-        cur = bytearray()
-        cur_off = 0
-        for i, b in enumerate(data):
-            if 0x20 <= b < 0x7f:
-                if not cur:
-                    cur_off = i
-                cur.append(b)
-            else:
-                if len(cur) >= min_len:
-                    self.strings.append({
-                        "offset": cur_off,
-                        "value": cur.decode("ascii", "replace"),
-                    })
-                cur = bytearray()
-        if len(cur) >= min_len:
-            self.strings.append({
-                "offset": cur_off,
-                "value": cur.decode("ascii", "replace"),
-            })
+    # --------------------------------------------------------
+    # FUNCTIONS
+    # --------------------------------------------------------
 
     def collect_functions(self):
-        # Lấy từ symbol table (FUNC type = 'STT_FUNC')
+        self.functions.clear()
+
+        seen = set()
+
         for name, info in self.symbols.items():
-            if info["type"] == "STT_FUNC":
-                self.functions.append({
-                    "name": name,
-                    "addr": info["value"],
-                    "size": info["size"],
-                    "source": "symtab",
-                })
-        # Sắp xếp theo địa chỉ
-        self.functions.sort(key=lambda x: x["addr"])
 
-    def disassemble_function(self, addr, size, max_insns=400):
-        from capstone import Cs, CS_OP_IMM, CS_OP_MEM, CS_OP_REG
-        try:
-            import capstone as cs_mod
-        except ImportError:
-            return []
+            if info["type"] != "STT_FUNC":
+                continue
 
-        arch_name, mode_name = self.CAPSTONE_MODE.get(
-            self.arch, (None, None))
-        if not arch_name:
-            return []
-        arch = getattr(cs_mod, arch_name, None)
-        mode = getattr(cs_mod, mode_name, 0)
-        if arch is None:
-            return []
-        md = Cs(arch, mode)
-        md.detail = True
+            address = info["value"]
 
-        # Lấy bytes
-        with open(self.path, "rb") as f:
-            raw = f.read()
-        # Chuyển vaddr -> file offset
-        from elftools.elf.elffile import ELFFile
-        seg_off = None
-        for seg in self.elf.iter_segments():
-            if seg["p_type"] == "PT_LOAD":
-                v = seg["p_vaddr"]
-                if v <= addr < v + seg["p_filesz"]:
-                    seg_off = seg["p_offset"] + (addr - v)
-                    break
-        if seg_off is None:
-            return []
-        code = raw[seg_off: seg_off + max(size, 64)]
+            if address in seen:
+                continue
 
-        insns = []
-        for insn in md.disasm(code, addr):
-            insns.append({
-                "addr": insn.address,
-                "mnemonic": insn.mnemonic,
-                "op_str": insn.op_str,
-                "bytes": insn.bytes.hex(),
+            seen.add(address)
+
+            self.functions.append({
+                "name": name,
+                "addr": address,
+                "size": info["size"],
+                "source": "symbol",
             })
-            if len(insns) >= max_insns:
-                break
-        return insns
+
+        self.functions.sort(
+            key=lambda item: item["addr"]
+        )
+
+        # ----------------------------------------------------
+        # Infer zero-size function boundaries from next symbol
+        # ----------------------------------------------------
+
+        for index, function in enumerate(self.functions):
+
+            if function["size"] != 0:
+                continue
+
+            if index + 1 < len(self.functions):
+
+                next_function = self.functions[index + 1]
+
+                difference = (
+                    next_function["addr"]
+                    - function["addr"]
+                )
+
+                if difference > 0:
+                    function["size"] = difference
+                    function["source"] = (
+                        "symbol+next-symbol-boundary"
+                    )
+
+    # --------------------------------------------------------
+    # STRINGS
+    # --------------------------------------------------------
+
+    def collect_strings(self, minimum=5):
+        self.strings.clear()
+
+        data = self.raw
+
+        start = None
+
+        for index, byte in enumerate(data):
+
+            printable = (
+                0x20 <= byte <= 0x7E
+            )
+
+            if printable:
+
+                if start is None:
+                    start = index
+
+            else:
+
+                if start is not None:
+
+                    length = index - start
+
+                    if length >= minimum:
+
+                        value = data[
+                            start:index
+                        ].decode(
+                            "ascii",
+                            "replace",
+                        )
+
+                        self.strings.append({
+                            "offset": start,
+                            "value": value,
+                        })
+
+                    start = None
+
+        if start is not None:
+
+            length = len(data) - start
+
+            if length >= minimum:
+
+                value = data[
+                    start:
+                ].decode(
+                    "ascii",
+                    "replace",
+                )
+
+                self.strings.append({
+                    "offset": start,
+                    "value": value,
+                })
+
+    # --------------------------------------------------------
+    # ADDRESS -> FILE OFFSET
+    # --------------------------------------------------------
+
+    def virtual_address_to_file_offset(self, address):
+
+        for segment in self.elf.iter_segments():
+
+            try:
+
+                if segment["p_type"] != "PT_LOAD":
+                    continue
+
+                virtual_start = segment["p_vaddr"]
+                file_size = segment["p_filesz"]
+
+                virtual_end = (
+                    virtual_start + file_size
+                )
+
+                if (
+                    virtual_start
+                    <= address
+                    < virtual_end
+                ):
+
+                    delta = (
+                        address
+                        - virtual_start
+                    )
+
+                    return (
+                        segment["p_offset"]
+                        + delta
+                    )
+
+            except Exception:
+                continue
+
+        return None
+
+    # --------------------------------------------------------
+    # DISASSEMBLE
+    # --------------------------------------------------------
+
+    def disassemble_function(
+        self,
+        address,
+        size,
+        max_instructions=1000,
+    ):
+        import capstone
+
+        architecture = self.arch
+
+        if architecture == "x86":
+
+            cs_arch = capstone.CS_ARCH_X86
+            cs_mode = capstone.CS_MODE_32
+
+        elif architecture == "x86_64":
+
+            cs_arch = capstone.CS_ARCH_X86
+            cs_mode = capstone.CS_MODE_64
+
+        elif architecture == "ARM":
+
+            cs_arch = capstone.CS_ARCH_ARM
+            cs_mode = (
+                capstone.CS_MODE_ARM
+                | (
+                    capstone.CS_MODE_BIG_ENDIAN
+                    if self.endian == ">"
+                    else 0
+                )
+            )
+
+        elif architecture == "ARM64":
+
+            cs_arch = capstone.CS_ARCH_ARM64
+
+            cs_mode = (
+                capstone.CS_MODE_BIG_ENDIAN
+                if self.endian == ">"
+                else capstone.CS_MODE_LITTLE_ENDIAN
+            )
+
+        elif architecture == "MIPS":
+
+            cs_arch = capstone.CS_ARCH_MIPS
+
+            cs_mode = capstone.CS_MODE_MIPS32
+
+            if self.bits == 64:
+                cs_mode = capstone.CS_MODE_MIPS64
+
+            if self.endian == ">":
+                cs_mode |= capstone.CS_MODE_BIG_ENDIAN
+            else:
+                cs_mode |= capstone.CS_MODE_LITTLE_ENDIAN
+
+        elif architecture == "RISC-V":
+
+            cs_arch = capstone.CS_ARCH_RISCV
+
+            if self.bits == 64:
+                cs_mode = capstone.CS_MODE_RISCV64
+            else:
+                cs_mode = capstone.CS_MODE_RISCV32
+
+        else:
+            return []
+
+        file_offset = (
+            self.virtual_address_to_file_offset(
+                address
+            )
+        )
+
+        if file_offset is None:
+            return []
+
+        if size <= 0:
+            size = 4096
+
+        maximum_bytes = min(
+            size,
+            1024 * 1024,
+        )
+
+        code = self.raw[
+            file_offset:
+            file_offset + maximum_bytes
+        ]
+
+        if not code:
+            return []
+
+        try:
+
+            disassembler = capstone.Cs(
+                cs_arch,
+                cs_mode,
+            )
+
+            disassembler.detail = True
+
+            instructions = []
+
+            for instruction in disassembler.disasm(
+                code,
+                address,
+            ):
+
+                instructions.append({
+                    "address": instruction.address,
+                    "mnemonic": instruction.mnemonic,
+                    "op_str": instruction.op_str,
+                    "bytes": instruction.bytes.hex(),
+                })
+
+                if (
+                    len(instructions)
+                    >= max_instructions
+                ):
+                    break
+
+            return instructions
+
+        except Exception as error:
+
+            self.warnings.append(
+                f"Disassembly error at "
+                f"0x{address:x}: {error}"
+            )
+
+            return []
+
+    # --------------------------------------------------------
+    # ANALYZE
+    # --------------------------------------------------------
 
     def analyze(self):
+
         self.load()
+        self.collect_sections()
         self.collect_symbols()
-        self.collect_strings()
         self.collect_functions()
+        self.collect_strings()
+
         return self
 
-# ============================================================
-# TÁI TẠO LOGIC (pseudocode) - CHỈ DỰA TRÊN PATTERN THẬT
-# ============================================================
-class LogicReconstructor:
-    """
-    Chuyển assembly -> pseudocode đọc được.
-    Nguyên tắc:
-    - Mỗi instruction map sang 1 dòng có cấu trúc.
-    - Nếu không đủ evidence -> UNKNOWN_OPERATION.
-    - Sinh if/while dựa trên nhận diện branch pattern.
-    """
 
-    # x86 & ARM branch mnemonics
-    JMP = {"jmp", "b", "bx", "br", "jr", "j"}
-    JCC = {
-        "je","jz","jne","jnz","jg","jge","jl","jle","ja","jae","jb","jbe",
-        "js","jns","jo","jno","jp","jnp","jc","jnc",
-        "beq","bne","bgt","bge","blt","ble","bhi","bls",
-        "cbz","cbnz","tbz","tbnz",
+# ============================================================
+# LOGIC RECONSTRUCTOR
+# ============================================================
+
+class LogicReconstructor:
+
+    CALL = {
+        "call",
+        "callq",
+        "bl",
+        "blx",
+        "jal",
+        "jalr",
+        "blr",
     }
-    CALL = {"call", "callq", "bl", "blx", "jal", "jalr", "blr"}
-    RET  = {"ret", "retq", "bx lr", "pop"}  # pop {..,pc} in ARM = return
-    NOP  = {"nop", "nop.w"}
-    CMP  = {"cmp", "cmn", "tst", "teq", "subs"}
+
+    RETURN = {
+        "ret",
+        "retq",
+    }
+
+    JUMP = {
+        "jmp",
+        "b",
+        "br",
+        "jr",
+    }
+
+    CONDITIONAL_JUMP = {
+        "je",
+        "jz",
+        "jne",
+        "jnz",
+        "jg",
+        "jge",
+        "jl",
+        "jle",
+        "ja",
+        "jae",
+        "jb",
+        "jbe",
+        "js",
+        "jns",
+        "jo",
+        "jno",
+        "jp",
+        "jnp",
+        "jc",
+        "jnc",
+        "beq",
+        "bne",
+        "bgt",
+        "bge",
+        "blt",
+        "ble",
+        "bhi",
+        "bls",
+        "cbz",
+        "cbnz",
+        "tbz",
+        "tbnz",
+    }
+
+    COMPARE = {
+        "cmp",
+        "cmn",
+        "tst",
+        "teq",
+    }
+
+    NOP = {
+        "nop",
+        "nop.w",
+    }
 
     def __init__(self, analyzer):
-        self.a = analyzer
+        self.analyzer = analyzer
 
-    def _label(self, addr):
-        return f"loc_{addr:x}"
+    # --------------------------------------------------------
 
-    def _op(self, insn):
-        return f"{insn['mnemonic']} {insn['op_str']}".strip()
+    @staticmethod
+    def instruction_text(instruction):
 
-    def reconstruct(self, func):
-        name = func["name"]
-        addr = func["addr"]
-        size = func["size"]
-        if size == 0:
-            return (
-                f"// function {name} @ 0x{addr:x}\n"
-                f"// UNKNOWN_OPERATION( address = 0x{addr:x}, "
-                f"reason = \"symbol size is zero, cannot delimit function\" )\n"
-            )
+        mnemonic = instruction["mnemonic"]
+        operands = instruction["op_str"]
 
-        insns = self.a.disassemble_function(addr, size)
-        if not insns:
-            return (
-                f"// function {name} @ 0x{addr:x}\n"
-                f"// UNKNOWN_OPERATION( address = 0x{addr:x}, "
-                f"reason = \"no disassembly produced\" )\n"
-            )
+        if operands:
+            return f"{mnemonic} {operands}"
 
-        lines = []
-        lines.append(f"// ---- function {name} @ 0x{addr:x} "
-                     f"(size={size}, arch={self.a.arch}) ----")
-        argn = self._guess_arg_count(insns)
-        args = ", ".join(f"arg_{i}" for i in range(argn))
-        lines.append(f"function_{addr:x}({args}) {{")
+        return mnemonic
 
-        indent = "    "
-        # Đơn giản hóa: duyệt tuần tự, phát hiện if/while bằng pattern
-        for i, insn in enumerate(insns):
-            mn = insn["mnemonic"]
-            txt = self._op(insn)
-            ln = f"{indent}// {hex(insn['addr'])}: {txt}"
+    # --------------------------------------------------------
 
-            if mn in self.NOP:
-                continue
+    @staticmethod
+    def label(address):
+        return f"loc_{address:x}"
 
-            if mn in self.CALL:
-                tgt = self._extract_call_target(insn)
-                if tgt is not None:
-                    lines.append(f"{indent}call_0x{tgt:x}();   // {txt}")
-                else:
-                    lines.append(f"{indent}// CALL (indirect): {txt}")
-                continue
+    # --------------------------------------------------------
 
-            if mn in self.RET or (mn == "pop" and "pc" in insn["op_str"]):
-                lines.append(f"{indent}return;   // {txt}")
-                continue
+    @staticmethod
+    def target(instruction):
 
-            if mn in self.JCC:
-                tgt = self._extract_branch_target(insn)
-                cond = self._cond_from_jcc(mn)
-                if tgt is not None:
-                    lines.append(
-                        f"{indent}if ({cond}) goto {self._label(tgt)};   // {txt}"
-                    )
-                else:
-                    lines.append(f"{indent}// BRANCH-UNKNOWN: {txt}")
-                continue
+        operands = instruction["op_str"].strip()
 
-            if mn in self.JMP:
-                tgt = self._extract_branch_target(insn)
-                if tgt is not None:
-                    lines.append(f"{indent}goto {self._label(tgt)};")
-                else:
-                    lines.append(f"{indent}// JUMP (indirect): {txt}")
-                continue
+        if not operands:
+            return None
 
-            if mn in self.CMP:
-                lines.append(f"{indent}// {txt}")
-                continue
+        token = operands.split(",", 1)[0].strip()
 
-            # Các lệnh còn lại -> đánh dấu UNKNOWN để không bịa ngữ nghĩa
-            lines.append(
-                f"{indent}UNKNOWN_OPERATION( address = 0x{insn['addr']:x}, "
-                f"reason = \"raw {mn}: {insn['op_str']}\" );"
-            )
+        try:
 
-        lines.append("}")
-        lines.append("")
-        return "\n".join(lines)
+            if token.startswith("0x"):
+                return int(token, 16)
 
-    def _extract_call_target(self, insn):
-        s = insn["op_str"]
-        if s.startswith("0x"):
-            try:
-                return int(s.split()[0], 16)
-            except Exception:
-                return None
+            if token.startswith("-0x"):
+                return -int(token[3:], 16)
+
+        except ValueError:
+            pass
+
         return None
 
-    def _extract_branch_target(self, insn):
-        s = insn["op_str"]
-        if s.startswith("0x"):
-            try:
-                return int(s.split()[0], 16)
-            except Exception:
-                return None
-        return None
+    # --------------------------------------------------------
 
-    def _cond_from_jcc(self, mn):
+    def condition(self, mnemonic):
+
         table = {
-            "je":"a == b","jz":"a == 0","jne":"a != b","jnz":"a != 0",
-            "jg":"a > b (signed)","jge":"a >= b (signed)",
-            "jl":"a < b (signed)","jle":"a <= b (signed)",
-            "ja":"a > b (unsigned)","jae":"a >= b (unsigned)",
-            "jb":"a < b (unsigned)","jbe":"a <= b (unsigned)",
-            "js":"sign_flag","jns":"!sign_flag",
-            "jo":"overflow","jno":"!overflow",
-            "beq":"arg0 == arg1","bne":"arg0 != arg1",
-            "bgt":"arg0 > arg1","bge":"arg0 >= arg1",
-            "blt":"arg0 < arg1","ble":"arg0 <= arg1",
-            "cbz":"arg0 == 0","cbnz":"arg0 != 0",
-        }
-        return table.get(mn, "condition_unknown")
+            "je": "ZF == 1",
+            "jz": "ZF == 1",
+            "jne": "ZF == 0",
+            "jnz": "ZF == 0",
 
-    def _guess_arg_count(self, insns):
-        # Heuristic tối thiểu: đếm thanh ghi arg được đọc trong ~30 lệnh đầu
-        regs_x86 = {"rdi","rsi","rdx","rcx","r8","r9"}
-        regs_arm = {"x0","x1","x2","x3","x4","x5","x6","x7",
-                    "w0","w1","w2","w3","w4","w5","w6","w7"}
-        found = set()
-        for ins in insns[:40]:
-            for tok in ins["op_str"].replace(",", " ").split():
-                t = tok.strip()
-                if t in regs_x86 or t in regs_arm:
-                    found.add(t)
+            "jg": "ZF == 0 && SF == OF",
+            "jge": "SF == OF",
+            "jl": "SF != OF",
+            "jle": "ZF == 1 || SF != OF",
+
+            "ja": "CF == 0 && ZF == 0",
+            "jae": "CF == 0",
+            "jb": "CF == 1",
+            "jbe": "CF == 1 || ZF == 1",
+
+            "js": "SF == 1",
+            "jns": "SF == 0",
+
+            "jo": "OF == 1",
+            "jno": "OF == 0",
+
+            "jp": "PF == 1",
+            "jnp": "PF == 0",
+
+            "jc": "CF == 1",
+            "jnc": "CF == 0",
+
+            "beq": "condition == true",
+            "bne": "condition == false",
+            "bgt": "signed >",
+            "bge": "signed >=",
+            "blt": "signed <",
+            "ble": "signed <=",
+
+            "bhi": "unsigned >",
+            "bls": "unsigned <=",
+
+            "cbz": "register == 0",
+            "cbnz": "register != 0",
+
+            "tbz": "bit == 0",
+            "tbnz": "bit != 0",
+        }
+
+        return table.get(
+            mnemonic,
+            "condition_unknown",
+        )
+
+    # --------------------------------------------------------
+
+    def guess_arguments(self, instructions):
+
+        if self.analyzer.arch == "x86_64":
+
+            registers = [
+                "rdi",
+                "rsi",
+                "rdx",
+                "rcx",
+                "r8",
+                "r9",
+            ]
+
+        elif self.analyzer.arch == "x86":
+
+            registers = [
+                "eax",
+                "ebx",
+                "ecx",
+                "edx",
+            ]
+
+        elif self.analyzer.arch == "ARM64":
+
+            registers = [
+                f"x{i}"
+                for i in range(8)
+            ]
+
+        elif self.analyzer.arch == "ARM":
+
+            registers = [
+                f"r{i}"
+                for i in range(4)
+            ]
+
+        else:
+            return 0
+
+        found = []
+
+        for instruction in instructions[:80]:
+
+            operands = (
+                instruction["op_str"]
+                .replace(",", " ")
+                .split()
+            )
+
+            for register in registers:
+
+                if register in operands:
+                    if register not in found:
+                        found.append(register)
+
         if not found:
             return 0
-        # map về chỉ số
-        def idx(r):
-            if r in regs_x86:
-                return ["rdi","rsi","rdx","rcx","r8","r9"].index(r)
-            if r.startswith(("x","w")):
-                try:
-                    return int(r[1:])
-                except Exception:
-                    return 0
-            return 0
-        return min(6, max(idx(r) for r in found) + 1)
+
+        highest = 0
+
+        for register in found:
+
+            try:
+
+                if self.analyzer.arch == "x86_64":
+                    index = registers.index(register)
+
+                elif self.analyzer.arch == "ARM64":
+                    index = int(register[1:])
+
+                elif self.analyzer.arch == "ARM":
+                    index = int(register[1:])
+
+                else:
+                    index = registers.index(register)
+
+                highest = max(
+                    highest,
+                    index + 1,
+                )
+
+            except Exception:
+                pass
+
+        return min(highest, 8)
+
+    # --------------------------------------------------------
+
+    def reconstruct(self, function):
+
+        name = function["name"]
+        address = function["addr"]
+        size = function["size"]
+
+        instructions = (
+            self.analyzer.disassemble_function(
+                address,
+                size,
+            )
+        )
+
+        output = []
+
+        output.append(
+            f"// =================================================="
+        )
+
+        output.append(
+            f"// FUNCTION: {name}"
+        )
+
+        output.append(
+            f"// ADDRESS : 0x{address:x}"
+        )
+
+        output.append(
+            f"// SIZE    : 0x{size:x}"
+        )
+
+        output.append(
+            f"// ARCH    : {self.analyzer.arch}"
+        )
+
+        output.append(
+            f"// SOURCE  : {function['source']}"
+        )
+
+        output.append(
+            f"// =================================================="
+        )
+
+        if not instructions:
+
+            output.append(
+                "// UNKNOWN_OPERATION"
+            )
+
+            output.append(
+                "// reason: unable to disassemble function"
+            )
+
+            return "\n".join(output)
+
+        argument_count = (
+            self.guess_arguments(
+                instructions
+            )
+        )
+
+        arguments = ", ".join(
+            f"arg_{i}"
+            for i in range(argument_count)
+        )
+
+        output.append(
+            f"function_{address:x}({arguments}) {{"
+        )
+
+        for instruction in instructions:
+
+            mnemonic = instruction[
+                "mnemonic"
+            ].lower()
+
+            operands = instruction[
+                "op_str"
+            ]
+
+            address_text = (
+                f"0x{instruction['address']:x}"
+            )
+
+            raw = (
+                self.instruction_text(
+                    instruction
+                )
+            )
+
+            if mnemonic in self.NOP:
+                continue
+
+            # ------------------------------------------------
+            # RETURN
+            # ------------------------------------------------
+
+            if mnemonic in self.RETURN:
+
+                output.append(
+                    f"    return; "
+                    f"// {address_text}: {raw}"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # CALL
+            # ------------------------------------------------
+
+            if mnemonic in self.CALL:
+
+                target = self.target(
+                    instruction
+                )
+
+                if target is not None:
+
+                    output.append(
+                        f"    call_0x{target:x}(); "
+                        f"// {address_text}: {raw}"
+                    )
+
+                else:
+
+                    output.append(
+                        f"    UNKNOWN_CALL("
+                        f"\"{raw}\""
+                        f");"
+                    )
+
+                continue
+
+            # ------------------------------------------------
+            # CONDITIONAL BRANCH
+            # ------------------------------------------------
+
+            if mnemonic in self.CONDITIONAL_JUMP:
+
+                target = self.target(
+                    instruction
+                )
+
+                condition = self.condition(
+                    mnemonic
+                )
+
+                if target is not None:
+
+                    output.append(
+                        f"    if ({condition}) "
+                        f"goto "
+                        f"{self.label(target)}; "
+                        f"// {address_text}: {raw}"
+                    )
+
+                else:
+
+                    output.append(
+                        f"    UNKNOWN_BRANCH("
+                        f"condition=\"{condition}\", "
+                        f"raw=\"{raw}\""
+                        f");"
+                    )
+
+                continue
+
+            # ------------------------------------------------
+            # UNCONDITIONAL BRANCH
+            # ------------------------------------------------
+
+            if mnemonic in self.JUMP:
+
+                target = self.target(
+                    instruction
+                )
+
+                if target is not None:
+
+                    output.append(
+                        f"    goto "
+                        f"{self.label(target)}; "
+                        f"// {address_text}: {raw}"
+                    )
+
+                else:
+
+                    output.append(
+                        f"    UNKNOWN_JUMP("
+                        f"\"{raw}\""
+                        f");"
+                    )
+
+                continue
+
+            # ------------------------------------------------
+            # COMPARE
+            # ------------------------------------------------
+
+            if mnemonic in self.COMPARE:
+
+                output.append(
+                    f"    // COMPARE: {raw}"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # EVERYTHING ELSE
+            # ------------------------------------------------
+
+            escaped = raw.replace(
+                "\\",
+                "\\\\",
+            ).replace(
+                "\"",
+                "\\\"",
+            )
+
+            output.append(
+                f"    UNKNOWN_OPERATION("
+                f"address=0x{instruction['address']:x}, "
+                f"raw=\"{escaped}\""
+                f");"
+            )
+
+        output.append("}")
+
+        return "\n".join(output)
+
+    # --------------------------------------------------------
+
+    def reconstruct_all(self):
+
+        results = []
+
+        for function in self.analyzer.functions:
+
+            try:
+
+                results.append(
+                    self.reconstruct(
+                        function
+                    )
+                )
+
+            except Exception as error:
+
+                results.append(
+                    "\n".join([
+                        f"// FUNCTION: "
+                        f"{function['name']}",
+                        f"// ADDRESS: "
+                        f"0x{function['addr']:x}",
+                        f"// UNKNOWN_OPERATION",
+                        f"// reason: "
+                        f"{error}",
+                    ])
+                )
+
+        return "\n\n".join(results)
+
 
 # ============================================================
-# PIPELINE PHÂN TÍCH CHÍNH
+# FILE HASH
 # ============================================================
-def analyze_so(so_path, job_id):
-    log(f"Analyzing {so_path}...")
-    start = time.time()
-    report_lines = []
-    report_lines.append("=" * 60)
-    report_lines.append("SO LOGIC RECONSTRUCTOR - OUTPUT")
-    report_lines.append("=" * 60)
-    report_lines.append(f"File: {os.path.basename(so_path)}")
-    report_lines.append(f"Job:  {job_id}")
-    report_lines.append(f"SHA1: {hashlib.sha1(open(so_path,'rb').read()).hexdigest()}")
-    report_lines.append("")
 
-    # 1. Kiểm tra ELF
+def sha256_file(path):
+
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as file:
+
+        while True:
+
+            chunk = file.read(
+                1024 * 1024
+            )
+
+            if not chunk:
+                break
+
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+# ============================================================
+# ANALYZE SO
+# ============================================================
+
+def analyze_so(path, job_id):
+
+    start_time = time.time()
+
+    log(f"Analyzing: {path}")
+
     try:
-        with open(so_path, "rb") as f:
-            magic = f.read(4)
-    except Exception as e:
-        return {"ok": False, "error": f"Cannot read file: {e}"}
 
-    if magic != b"\x7fELF":
-        return {"ok": False, "error": "Invalid ELF file."}
+        analyzer = (
+            ELFAnalyzer(path)
+            .analyze()
+        )
 
-    # 2. Load ELF
-    try:
-        analyzer = ELFAnalyzer(so_path).analyze()
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
-    except Exception as e:
-        return {"ok": False, "error": f"ELF parse error: {e}"}
+    except Exception as error:
 
-    report_lines.append("--- ELF HEADER ---")
-    report_lines.append(f"Architecture : {analyzer.arch}")
-    report_lines.append(f"Bits         : {analyzer.bits}")
-    report_lines.append(f"Endian       : {'little' if analyzer.endian=='<' else 'big'}")
-    report_lines.append("")
+        return {
+            "ok": False,
+            "error": str(error),
+        }
+
+    lines = []
+
+    lines.append(
+        "=" * 70
+    )
+
+    lines.append(
+        "SO LOGIC RECONSTRUCTOR"
+    )
+
+    lines.append(
+        "=" * 70
+    )
+
+    lines.append(
+        f"File         : "
+        f"{os.path.basename(path)}"
+    )
+
+    lines.append(
+        f"Job          : {job_id}"
+    )
+
+    lines.append(
+        f"SHA256       : "
+        f"{sha256_file(path)}"
+    )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # ELF
+    # --------------------------------------------------------
+
+    lines.append(
+        "--- ELF INFORMATION ---"
+    )
+
+    lines.append(
+        f"Architecture : {analyzer.arch}"
+    )
+
+    lines.append(
+        f"Bits         : {analyzer.bits}"
+    )
+
+    lines.append(
+        f"Endian       : "
+        f"{'little' if analyzer.endian == '<' else 'big'}"
+    )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # WARNINGS
+    # --------------------------------------------------------
 
     if analyzer.warnings:
-        report_lines.append("--- WARNINGS ---")
-        for w in analyzer.warnings:
-            report_lines.append(w)
-        report_lines.append("")
 
-    # 3. Sections
-    report_lines.append("--- SECTIONS ---")
-    for sec in analyzer.elf.iter_sections():
-        try:
-            report_lines.append(
-                f"  {sec.name:<20} type={sec['sh_type']:<16} "
-                f"addr=0x{sec['sh_addr']:x} size=0x{sec['sh_size']:x}"
-            )
-        except Exception:
-            pass
-    report_lines.append("")
-
-    # 4. Strings (giới hạn 200)
-    report_lines.append(f"--- STRINGS (showing up to 200 of {len(analyzer.strings)}) ---")
-    for s in analyzer.strings[:200]:
-        report_lines.append(f"  0x{s['offset']:08x}: {s['value']}")
-    report_lines.append("")
-
-    # 5. Functions
-    report_lines.append(f"--- FUNCTIONS ({len(analyzer.functions)}) ---")
-    for fn in analyzer.functions:
-        report_lines.append(
-            f"  {fn['name']:<40} @ 0x{fn['addr']:x}  size=0x{fn['size']:x}"
+        lines.append(
+            "--- WARNINGS ---"
         )
-    report_lines.append("")
+
+        for warning in analyzer.warnings:
+
+            lines.append(
+                f"- {warning}"
+            )
+
+        lines.append("")
+
+    # --------------------------------------------------------
+    # SECTIONS
+    # --------------------------------------------------------
+
+    lines.append(
+        "--- SECTIONS ---"
+    )
+
+    for section in analyzer.sections:
+
+        lines.append(
+            f"{section['name']:<25} "
+            f"type={section['type']:<15} "
+            f"addr=0x{section['address']:x} "
+            f"size=0x{section['size']:x}"
+        )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # STRINGS
+    # --------------------------------------------------------
+
+    lines.append(
+        "--- STRINGS ---"
+    )
+
+    lines.append(
+        f"Total strings: "
+        f"{len(analyzer.strings)}"
+    )
+
+    for item in analyzer.strings[:500]:
+
+        lines.append(
+            f"0x{item['offset']:08x}: "
+            f"{item['value']}"
+        )
+
+    if len(analyzer.strings) > 500:
+
+        lines.append(
+            f"... "
+            f"{len(analyzer.strings) - 500} "
+            f"more strings omitted"
+        )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # FUNCTIONS
+    # --------------------------------------------------------
+
+    lines.append(
+        "--- FUNCTIONS ---"
+    )
+
+    lines.append(
+        f"Total functions: "
+        f"{len(analyzer.functions)}"
+    )
+
+    for function in analyzer.functions:
+
+        lines.append(
+            f"{function['name']:<45} "
+            f"0x{function['addr']:x} "
+            f"size=0x{function['size']:x} "
+            f"[{function['source']}]"
+        )
 
     if not analyzer.functions:
-        report_lines.append(
-            "Partial reconstruction: No FUNC symbols found in binary. "
-            "Cannot enumerate function boundaries reliably. "
-            "Only sections/strings above are trustworthy."
+
+        lines.append(
+            "No STT_FUNC symbols found."
         )
 
-    # 6. Reconstruct từng function
-    report_lines.append("=" * 60)
-    report_lines.append("--- RECONSTRUCTED LOGIC ---")
-    report_lines.append("=" * 60)
-    recon = LogicReconstructor(analyzer)
-    for fn in analyzer.functions:
-        try:
-            report_lines.append(recon.reconstruct(fn))
-        except Exception as e:
-            report_lines.append(
-                f"// function {fn['name']} @ 0x{fn['addr']:x}"
+        lines.append(
+            "Function recovery from raw code is "
+            "not automatically assumed."
+        )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # RECONSTRUCTION
+    # --------------------------------------------------------
+
+    lines.append(
+        "=" * 70
+    )
+
+    lines.append(
+        "RECONSTRUCTED LOGIC"
+    )
+
+    lines.append(
+        "=" * 70
+    )
+
+    if analyzer.functions:
+
+        reconstructor = (
+            LogicReconstructor(
+                analyzer
             )
-            report_lines.append(
-                f"// UNKNOWN_OPERATION( address = 0x{fn['addr']:x}, "
-                f"reason = \"reconstruction failed: {e}\" )"
-            )
-            report_lines.append("")
+        )
 
-    elapsed = time.time() - start
-    report_lines.append("=" * 60)
-    report_lines.append(f"Done in {elapsed:.2f}s")
-    report_lines.append("=" * 60)
+        reconstructed = (
+            reconstructor.reconstruct_all()
+        )
 
-    text = "\n".join(report_lines)
+        lines.append(
+            reconstructed
+        )
 
-    # Lưu output
-    out_path = os.path.join(OUTPUT_DIR, f"{job_id}.txt")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(text)
+    else:
 
-    # Log file
-    log_path = os.path.join(LOG_DIR, f"{job_id}.log")
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write(text)
+        lines.append(
+            "// No reliable function boundaries."
+        )
+
+        lines.append(
+            "// Logic reconstruction skipped."
+        )
+
+    # --------------------------------------------------------
+    # FOOTER
+    # --------------------------------------------------------
+
+    elapsed = (
+        time.time()
+        - start_time
+    )
+
+    lines.append("")
+
+    lines.append(
+        "=" * 70
+    )
+
+    lines.append(
+        f"Analysis finished in "
+        f"{elapsed:.2f}s"
+    )
+
+    lines.append(
+        "Unknown operations are intentionally "
+        "not guessed."
+    )
+
+    lines.append(
+        "by MC_meme_edit"
+    )
+
+    lines.append(
+        "=" * 70
+    )
+
+    text = "\n".join(lines)
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
+    output_path = os.path.join(
+        OUTPUT_DIR,
+        f"{job_id}.txt",
+    )
+
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        file.write(text)
 
     return {
         "ok": True,
         "job_id": job_id,
         "arch": analyzer.arch,
         "bits": analyzer.bits,
-        "num_functions": len(analyzer.functions),
-        "num_strings": len(analyzer.strings),
+        "functions": len(
+            analyzer.functions
+        ),
+        "strings": len(
+            analyzer.strings
+        ),
         "warnings": analyzer.warnings,
         "text": text,
-        "download": f"/download/{job_id}",
+        "download": (
+            f"/download/{job_id}"
+        ),
     }
 
+
 # ============================================================
-# HTML/CSS/JS FRONTEND (nhúng thẳng)
+# HTML
 # ============================================================
-INDEX_HTML = r"""<!DOCTYPE html>
+
+INDEX_HTML = r"""
+<!DOCTYPE html>
+
 <html lang="vi">
+
 <head>
+
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>SO LOGIC RECONSTRUCTOR</title>
+
+<meta
+    name="viewport"
+    content="width=device-width,
+             initial-scale=1,
+             maximum-scale=1"
+/>
+
+<title>
+SO LOGIC RECONSTRUCTOR
+</title>
+
 <style>
-  :root{
-    --bg:#0d1117; --panel:#161b22; --panel2:#1f2630;
-    --fg:#e6edf3; --muted:#8b949e; --accent:#2f81f7;
-    --ok:#3fb950; --warn:#d29922; --err:#f85149;
-  }
-  *{box-sizing:border-box}
-  body{
-    margin:0; background:var(--bg); color:var(--fg);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-    font-size:15px; line-height:1.45;
-  }
-  header{
-    padding:14px 16px; background:var(--panel);
-    border-bottom:1px solid #30363d; text-align:center; font-weight:700;
-    letter-spacing:1px;
-  }
-  main{padding:14px; max-width:900px; margin:0 auto}
-  .card{
-    background:var(--panel); border:1px solid #30363d;
-    border-radius:10px; padding:14px; margin-bottom:14px;
-  }
-  label.file{
-    display:block; padding:14px; border:2px dashed #30363d;
-    border-radius:10px; text-align:center; color:var(--muted);
-    cursor:pointer;
-  }
-  label.file input{display:none}
-  button{
-    background:var(--accent); color:#fff; border:0; padding:12px 16px;
-    border-radius:8px; font-weight:600; font-size:15px; cursor:pointer;
-    width:100%; margin-top:10px;
-  }
-  button:disabled{opacity:.5; cursor:not-allowed}
-  button.secondary{background:#30363d}
-  .row{display:flex; gap:8px; margin-top:10px}
-  .row button{margin-top:0}
-  .progress{
-    height:10px; background:#30363d; border-radius:5px; overflow:hidden;
-    margin-top:8px;
-  }
-  .progress > div{
-    height:100%; width:0%; background:var(--accent);
-    transition:width .3s ease;
-  }
-  .status{color:var(--muted); font-size:13px; margin-top:6px}
-  .warn{color:var(--warn)}
-  .err{color:var(--err)}
-  textarea{
-    width:100%; min-height:340px; background:#0b0f14; color:#c9d1d9;
-    border:1px solid #30363d; border-radius:8px; padding:10px;
-    font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px;
-    line-height:1.5; resize:vertical;
-  }
-  .meta{font-size:12px; color:var(--muted); margin:6px 0}
-  .hidden{display:none}
-  h2{font-size:14px; margin:0 0 8px; color:var(--muted); text-transform:uppercase; letter-spacing:1px}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0d1117;
+    color: #e6edf3;
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Roboto,
+        sans-serif;
+}
+
+header {
+    padding: 16px;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    text-align: center;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+main {
+    max-width: 950px;
+    margin: auto;
+    padding: 14px;
+}
+
+.card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 14px;
+}
+
+.filebox {
+    display: block;
+    border: 2px dashed #30363d;
+    border-radius: 10px;
+    padding: 22px 12px;
+    text-align: center;
+    color: #8b949e;
+}
+
+.filebox input {
+    display: none;
+}
+
+button {
+    width: 100%;
+    border: 0;
+    border-radius: 8px;
+    padding: 12px;
+    margin-top: 10px;
+    background: #2f81f7;
+    color: white;
+    font-weight: 700;
+    font-size: 15px;
+}
+
+button.secondary {
+    background: #30363d;
+}
+
+button:disabled {
+    opacity: .5;
+}
+
+.row {
+    display: flex;
+    gap: 8px;
+}
+
+.row button {
+    flex: 1;
+}
+
+.progress {
+    height: 9px;
+    margin-top: 12px;
+    background: #30363d;
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.progressbar {
+    height: 100%;
+    width: 0%;
+    background: #2f81f7;
+    transition: width .2s;
+}
+
+.status {
+    margin-top: 8px;
+    color: #8b949e;
+    font-size: 13px;
+}
+
+.error {
+    color: #f85149;
+}
+
+.success {
+    color: #3fb950;
+}
+
+textarea {
+    width: 100%;
+    min-height: 450px;
+    resize: vertical;
+    background: #0b0f14;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px;
+    font-family:
+        monospace;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.meta {
+    color: #8b949e;
+    font-size: 12px;
+    margin-bottom: 10px;
+}
+
+.hidden {
+    display: none;
+}
+
 </style>
+
 </head>
+
 <body>
-<header>SO LOGIC RECONSTRUCTOR</header>
+
+<header>
+SO LOGIC RECONSTRUCTOR
+</header>
+
 <main>
 
-  <div class="card">
-    <label class="file" id="drop">
-      <input type="file" id="file" accept=".so,application/octet-stream">
-      <span id="fileName">📂 Chọn file .so</span>
-    </label>
-    <button id="run" disabled>Dịch ngược</button>
-    <div class="progress"><div id="bar"></div></div>
-    <div class="status" id="status">Sẵn sàng.</div>
-  </div>
+<div class="card">
 
-  <div class="card hidden" id="resultCard">
-    <h2>Decompiled Logic</h2>
-    <div class="meta" id="meta"></div>
-    <textarea id="editor" spellcheck="false"></textarea>
-    <div class="row">
-      <button class="secondary" id="copy">Copy</button>
-      <button class="secondary" id="save">Save TXT</button>
-      <button id="download">Download TXT</button>
-    </div>
-    <div class="status" id="dlStatus"></div>
-  </div>
+<label class="filebox">
+
+<input
+    id="file"
+    type="file"
+    accept=".so,application/octet-stream"
+/>
+
+<span id="filename">
+📂 Chọn file .so
+</span>
+
+</label>
+
+<button id="analyze" disabled>
+Dịch ngược
+</button>
+
+<div class="progress">
+
+<div
+    id="progressbar"
+    class="progressbar">
+</div>
+
+</div>
+
+<div id="status" class="status">
+Sẵn sàng.
+</div>
+
+</div>
+
+
+<div
+    id="result"
+    class="card hidden">
+
+<div class="meta" id="meta"></div>
+
+<textarea
+    id="editor"
+    spellcheck="false">
+</textarea>
+
+<div class="row">
+
+<button
+    id="copy"
+    class="secondary">
+Copy
+</button>
+
+<button
+    id="save"
+    class="secondary">
+Save TXT
+</button>
+
+</div>
+
+<button id="download">
+Download TXT
+</button>
+
+</div>
 
 </main>
+
+
 <script>
-const $ = s => document.querySelector(s);
-const fileInput = $("#file");
-const btnRun = $("#run");
-const bar = $("#bar");
-const statusEl = $("#status");
-const resultCard = $("#resultCard");
-const editor = $("#editor");
-const meta = $("#meta");
-let currentText = "";
+
+const file =
+    document.getElementById("file");
+
+const analyze =
+    document.getElementById("analyze");
+
+const filename =
+    document.getElementById("filename");
+
+const status =
+    document.getElementById("status");
+
+const progress =
+    document.getElementById("progressbar");
+
+const result =
+    document.getElementById("result");
+
+const editor =
+    document.getElementById("editor");
+
+const meta =
+    document.getElementById("meta");
+
 let currentJob = "";
 
-fileInput.addEventListener("change", e => {
-  const f = e.target.files[0];
-  if (!f) return;
-  $("#fileName").textContent = "📄 " + f.name;
-  btnRun.disabled = false;
-});
 
-function setStatus(t, cls=""){
-  statusEl.textContent = t;
-  statusEl.className = "status " + cls;
+function setStatus(
+    message,
+    type = ""
+) {
+
+    status.textContent = message;
+
+    status.className =
+        "status " + type;
 }
-function setBar(p){ bar.style.width = p + "%"; }
 
-btnRun.addEventListener("click", async () => {
-  const f = fileInput.files[0];
-  if (!f) return;
-  btnRun.disabled = true;
-  resultCard.classList.add("hidden");
-  setBar(0);
-  setStatus("Đang upload...");
 
-  const fd = new FormData();
-  fd.append("file", f);
+function setProgress(
+    value
+) {
 
-  try{
-    setBar(5);
-    const xhr = new XMLHttpRequest();
-    const p = new Promise((res, rej) => {
-      xhr.open("POST", "/analyze");
-      xhr.upload.onprogress = e => {
-        if (e.lengthComputable){
-          setBar(5 + (e.loaded/e.total)*15);
+    progress.style.width =
+        value + "%";
+}
+
+
+file.addEventListener(
+    "change",
+    () => {
+
+        const selected =
+            file.files[0];
+
+        if (!selected) {
+            return;
         }
-      };
-      xhr.onload = () => res(xhr);
-      xhr.onerror = () => rej(new Error("Network error"));
-      xhr.send(fd);
-    });
-    setStatus("Đang phân tích ELF (có thể mất vài giây)...");
-    setBar(25);
-    const xhr = await p;
-    setBar(100);
-    if (xhr.status !== 200){
-      setStatus("Lỗi: " + xhr.responseText, "err");
-      btnRun.disabled = false;
-      return;
+
+        filename.textContent =
+            "📄 " + selected.name;
+
+        analyze.disabled =
+            false;
+
     }
-    const data = JSON.parse(xhr.responseText);
-    if (!data.ok){
-      setStatus("Lỗi: " + data.error, "err");
-      btnRun.disabled = false;
-      return;
+);
+
+
+analyze.addEventListener(
+    "click",
+    async () => {
+
+        const selected =
+            file.files[0];
+
+        if (!selected) {
+            return;
+        }
+
+        analyze.disabled =
+            true;
+
+        result.classList.add(
+            "hidden"
+        );
+
+        setProgress(0);
+
+        setStatus(
+            "Đang upload..."
+        );
+
+        const form =
+            new FormData();
+
+        form.append(
+            "file",
+            selected
+        );
+
+        try {
+
+            const response =
+                await new Promise(
+                    (resolve, reject) => {
+
+                        const xhr =
+                            new XMLHttpRequest();
+
+                        xhr.open(
+                            "POST",
+                            "/analyze"
+                        );
+
+                        xhr.upload.onprogress =
+                            event => {
+
+                                if (
+                                    event.lengthComputable
+                                ) {
+
+                                    const value =
+                                        (
+                                            event.loaded
+                                            /
+                                            event.total
+                                        ) * 20;
+
+                                    setProgress(
+                                        value
+                                    );
+
+                                }
+
+                            };
+
+                        xhr.onload =
+                            () => resolve(xhr);
+
+                        xhr.onerror =
+                            () =>
+                                reject(
+                                    new Error(
+                                        "Network error"
+                                    )
+                                );
+
+                        xhr.send(form);
+
+                    }
+                );
+
+
+            if (
+                response.status !== 200
+            ) {
+
+                throw new Error(
+                    response.responseText
+                );
+
+            }
+
+
+            const data =
+                JSON.parse(
+                    response.responseText
+                );
+
+
+            if (!data.ok) {
+
+                throw new Error(
+                    data.error
+                );
+
+            }
+
+
+            setProgress(100);
+
+            currentJob =
+                data.job_id;
+
+            editor.value =
+                data.text;
+
+            meta.textContent =
+                "Architecture: "
+                + data.arch
+                + " | Bits: "
+                + data.bits
+                + " | Functions: "
+                + data.functions
+                + " | Strings: "
+                + data.strings;
+
+
+            result.classList.remove(
+                "hidden"
+            );
+
+            setStatus(
+                "Phân tích hoàn tất.",
+                "success"
+            );
+
+        }
+
+        catch (error) {
+
+            setStatus(
+                "Lỗi: "
+                + error.message,
+                "error"
+            );
+
+        }
+
+        finally {
+
+            analyze.disabled =
+                false;
+
+        }
+
     }
-    currentText = data.text;
-    currentJob = data.job_id;
-    editor.value = currentText;
-    meta.textContent =
-      `Arch: ${data.arch} | Bits: ${data.bits} | ` +
-      `Functions: ${data.num_functions} | Strings: ${data.num_strings}` +
-      (data.warnings && data.warnings.length ? " | ⚠ " + data.warnings.join(" ") : "");
-    resultCard.classList.remove("hidden");
-    setStatus("Hoàn tất.", "");
-  }catch(e){
-    setStatus("Lỗi: " + e.message, "err");
-  }finally{
-    btnRun.disabled = false;
-  }
-});
+);
 
-$("#copy").addEventListener("click", async () => {
-  try{
-    await navigator.clipboard.writeText(editor.value);
-    setStatus("Đã copy vào clipboard.");
-  }catch(e){
-    setStatus("Không copy được: " + e.message, "err");
-  }
-});
 
-$("#save").addEventListener("click", () => {
-  const blob = new Blob([editor.value], {type:"text/plain;charset=utf-8"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "decompiled_logic.txt";
-  a.click();
-  URL.revokeObjectURL(a.href);
-});
+document.getElementById(
+    "copy"
+).addEventListener(
+    "click",
+    async () => {
 
-$("#download").addEventListener("click", () => {
-  if (!currentJob) return;
-  window.location = "/download/" + currentJob;
-});
+        try {
+
+            await navigator.clipboard
+                .writeText(
+                    editor.value
+                );
+
+            setStatus(
+                "Đã copy."
+            );
+
+        }
+
+        catch (error) {
+
+            setStatus(
+                "Không thể copy: "
+                + error.message,
+                "error"
+            );
+
+        }
+
+    }
+);
+
+
+document.getElementById(
+    "save"
+).addEventListener(
+    "click",
+    () => {
+
+        const blob =
+            new Blob(
+                [editor.value],
+                {
+                    type:
+                        "text/plain;charset=utf-8"
+                }
+            );
+
+        const url =
+            URL.createObjectURL(
+                blob
+            );
+
+        const link =
+            document.createElement(
+                "a"
+            );
+
+        link.href = url;
+
+        link.download =
+            "decompiled_logic.txt";
+
+        link.click();
+
+        URL.revokeObjectURL(
+            url
+        );
+
+    }
+);
+
+
+document.getElementById(
+    "download"
+).addEventListener(
+    "click",
+    () => {
+
+        if (!currentJob) {
+            return;
+        }
+
+        window.location =
+            "/download/"
+            + currentJob;
+
+    }
+);
+
 </script>
+
 </body>
+
 </html>
 """
+
 
 # ============================================================
 # HTTP SERVER
 # ============================================================
-class Handler(BaseHTTPRequestHandler):
-    server_version = "SORecon/1.0"
 
-    def log_message(self, fmt, *args):
-        # log gọn
-        print(f"[web] {self.address_string()} - {fmt % args}", flush=True)
+class Handler(
+    BaseHTTPRequestHandler
+):
 
-    def _send(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        if extra:
-            for k, v in extra.items():
-                self.send_header(k, v)
+    server_version = (
+        "SORecon/2.0"
+    )
+
+    def log_message(
+        self,
+        format_string,
+        *args
+    ):
+
+        print(
+            "[web] "
+            + (
+                format_string
+                % args
+            ),
+            flush=True,
+        )
+
+    # --------------------------------------------------------
+
+    def send_bytes(
+        self,
+        status_code,
+        data,
+        content_type="text/plain; charset=utf-8",
+        headers=None,
+    ):
+
+        self.send_response(
+            status_code
+        )
+
+        self.send_header(
+            "Content-Type",
+            content_type
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(data))
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store"
+        )
+
+        if headers:
+
+            for key, value in headers.items():
+
+                self.send_header(
+                    key,
+                    value
+                )
+
         self.end_headers()
+
         try:
-            self.wfile.write(body)
+
+            self.wfile.write(
+                data
+            )
+
         except BrokenPipeError:
             pass
 
+    # --------------------------------------------------------
+
+    def send_json(
+        self,
+        data,
+        status_code=200,
+    ):
+
+        payload = json.dumps(
+            data,
+            ensure_ascii=False,
+        ).encode(
+            "utf-8"
+        )
+
+        self.send_bytes(
+            status_code,
+            payload,
+            "application/json; charset=utf-8",
+        )
+
+    # --------------------------------------------------------
+
     def do_GET(self):
-        path = urlparse(self.path).path
 
-        if path == "/" or path == "/index.html":
-            body = INDEX_HTML.encode("utf-8")
-            self._send(200, body, "text/html; charset=utf-8")
+        path = urlparse(
+            self.path
+        ).path
+
+        if path in (
+            "/",
+            "/index.html",
+        ):
+
+            self.send_bytes(
+                200,
+                INDEX_HTML.encode(
+                    "utf-8"
+                ),
+                "text/html; charset=utf-8",
+            )
+
             return
 
-        if path.startswith("/download/"):
-            job_id = path.rsplit("/", 1)[-1]
-            job_id = "".join(c for c in job_id if c.isalnum() or c in "-_")
-            fpath = os.path.join(OUTPUT_DIR, f"{job_id}.txt")
-            if not os.path.isfile(fpath):
-                self._send(404, b"Not found")
+
+        if path.startswith(
+            "/download/"
+        ):
+
+            job_id = path.split(
+                "/",
+                2
+            )[-1]
+
+            safe_job = "".join(
+                character
+                for character in job_id
+                if (
+                    character.isalnum()
+                    or character in "_-"
+                )
+            )
+
+            if not safe_job:
+                self.send_bytes(
+                    400,
+                    b"Invalid job id"
+                )
                 return
-            with open(fpath, "rb") as f:
-                data = f.read()
-            self._send(200, data, "text/plain; charset=utf-8", {
-                "Content-Disposition": f'attachment; filename="decompiled_logic.txt"'
-            })
+
+            path = os.path.join(
+                OUTPUT_DIR,
+                safe_job + ".txt",
+            )
+
+            if not os.path.isfile(
+                path
+            ):
+
+                self.send_bytes(
+                    404,
+                    b"File not found"
+                )
+
+                return
+
+            try:
+
+                with open(
+                    path,
+                    "rb"
+                ) as file:
+
+                    data = file.read()
+
+                self.send_bytes(
+                    200,
+                    data,
+                    "text/plain; charset=utf-8",
+                    {
+                        "Content-Disposition":
+                            'attachment; '
+                            'filename="decompiled_logic.txt"'
+                    },
+                )
+
+            except Exception as error:
+
+                self.send_bytes(
+                    500,
+                    str(error).encode()
+                )
+
             return
 
-        self._send(404, b"Not found")
+
+        self.send_bytes(
+            404,
+            b"Not found"
+        )
+
+    # --------------------------------------------------------
 
     def do_POST(self):
-        path = urlparse(self.path).path
+
+        path = urlparse(
+            self.path
+        ).path
+
         if path != "/analyze":
-            self._send(404, b"Not found")
+
+            self.send_bytes(
+                404,
+                b"Not found"
+            )
+
             return
+
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+
+            content_length = int(
+                self.headers.get(
+                    "Content-Length",
+                    "0"
+                )
+            )
+
         except ValueError:
-            self._send(400, b"Bad length")
+
+            self.send_bytes(
+                400,
+                b"Invalid Content-Length"
+            )
+
             return
 
-        if length <= 0 or length > 200 * 1024 * 1024:
-            self._send(400, b"Invalid size")
+
+        if (
+            content_length <= 0
+            or content_length > MAX_UPLOAD_SIZE
+        ):
+
+            self.send_bytes(
+                413,
+                b"Upload too large"
+            )
+
             return
 
-        raw = self.rfile.read(length)
-        boundary = None
-        ctype = self.headers.get("Content-Type", "")
-        if "boundary=" in ctype:
-            boundary = ctype.split("boundary=", 1)[1].encode()
-        if not boundary:
-            self._send(400, b"No boundary")
+
+        content_type = self.headers.get(
+            "Content-Type",
+            ""
+        )
+
+
+        if not content_type.startswith(
+            "multipart/form-data"
+        ):
+
+            self.send_bytes(
+                400,
+                b"Expected multipart/form-data"
+            )
+
             return
 
-        # Parse multipart đơn giản
-        parts = raw.split(b"--" + boundary)
-        file_bytes = None
-        for p in parts:
-            if b'name="file"' in p:
-                try:
-                    header_end = p.index(b"\r\n\r\n") + 4
-                except ValueError:
+
+        try:
+
+            body = self.rfile.read(
+                content_length
+            )
+
+            # ------------------------------------------------
+            # Parse multipart bằng parser chuẩn Python
+            # ------------------------------------------------
+
+            header_blob = (
+                b"Content-Type: "
+                + content_type.encode()
+                + b"\r\n"
+                + b"\r\n"
+            )
+
+            message = (
+                BytesParser(
+                    policy=default
+                ).parsebytes(
+                    header_blob
+                    + body
+                )
+            )
+
+            file_bytes = None
+            original_name = "uploaded.so"
+
+            if not message.is_multipart():
+
+                raise ValueError(
+                    "Invalid multipart request"
+                )
+
+            for part in message.iter_parts():
+
+                disposition = (
+                    part.get(
+                        "Content-Disposition",
+                        ""
+                    )
+                )
+
+                if (
+                    'name="file"'
+                    not in disposition
+                ):
                     continue
-                file_bytes = p[header_end:]
-                # Cắt \r\n cuối
-                if file_bytes.endswith(b"\r\n"):
-                    file_bytes = file_bytes[:-2]
+
+                file_bytes = (
+                    part.get_payload(
+                        decode=True
+                    )
+                )
+
+                filename = (
+                    part.get_filename()
+                )
+
+                if filename:
+                    original_name = (
+                        os.path.basename(
+                            filename
+                        )
+                    )
+
                 break
 
-        if not file_bytes:
-            self._send(400, b"No file")
-            return
 
-        if file_bytes[:4] != b"\x7fELF":
-            self._send(200, json.dumps({
-                "ok": False,
-                "error": "Invalid ELF file."
-            }).encode("utf-8"), "application/json")
-            return
+            if not file_bytes:
 
-        job_id = hashlib.md5(
-            file_bytes + str(time.time()).encode()
-        ).hexdigest()[:12]
-        fname = f"{job_id}.so"
-        fpath = os.path.join(UPLOAD_DIR, fname)
-        with open(fpath, "wb") as f:
-            f.write(file_bytes)
+                raise ValueError(
+                    "No file uploaded"
+                )
+
+
+            if len(file_bytes) > MAX_UPLOAD_SIZE:
+
+                raise ValueError(
+                    "Uploaded file is too large"
+                )
+
+
+            if file_bytes[:4] != (
+                b"\x7fELF"
+            ):
+
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error":
+                            "Uploaded file is "
+                            "not an ELF binary.",
+                    }
+                )
+
+                return
+
+
+            # ------------------------------------------------
+            # Job ID
+            # ------------------------------------------------
+
+            job_id = hashlib.sha256(
+                file_bytes
+                + str(
+                    time.time_ns()
+                ).encode()
+            ).hexdigest()[:16]
+
+
+            filename = (
+                job_id
+                + "_"
+                + original_name
+            )
+
+            filename = filename.replace(
+                "/",
+                "_"
+            ).replace(
+                "\\",
+                "_"
+            )
+
+            uploaded_path = os.path.join(
+                UPLOAD_DIR,
+                filename
+            )
+
+
+            with open(
+                uploaded_path,
+                "wb"
+            ) as file:
+
+                file.write(
+                    file_bytes
+                )
+
+
+            # ------------------------------------------------
+            # Analyze
+            # ------------------------------------------------
+
+            result = analyze_so(
+                uploaded_path,
+                job_id
+            )
+
+            self.send_json(
+                result
+            )
+
+        except Exception as error:
+
+            traceback.print_exc()
+
+            self.send_json(
+                {
+                    "ok": False,
+                    "error":
+                        str(error),
+                },
+                500,
+            )
+
+
+# ============================================================
+# BROWSER
+# ============================================================
+
+def open_browser(url):
+
+    def worker():
+
+        time.sleep(
+            1.2
+        )
+
+        if has_command(
+            "termux-open-url"
+        ):
+
+            try:
+
+                subprocess.run(
+                    [
+                        "termux-open-url",
+                        url,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+
+                log(
+                    f"Browser opened: {url}"
+                )
+
+                return
+
+            except Exception:
+                pass
+
 
         try:
-            result = analyze_so(fpath, job_id)
-            self._send(200, json.dumps(result).encode("utf-8"),
-                       "application/json")
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(tb, flush=True)
-            self._send(500, json.dumps({
-                "ok": False,
-                "error": f"Internal error: {e}"
-            }).encode("utf-8"), "application/json")
 
-# ============================================================
-# MỞ TRÌNH DUYỆT
-# ============================================================
-def open_browser(url):
-    def _go():
-        time.sleep(1.2)
-        # Thử Termux API trước (ổn định nhất trên Android)
-        opened = False
-        if has_cmd("termux-open-url"):
-            try:
-                subprocess.run(["termux-open-url", url],
-                               capture_output=True, timeout=10)
-                opened = True
-                log(f"Opened via termux-open-url: {url}")
-            except Exception as e:
-                log_err(f"termux-open-url failed: {e}")
-        if not opened:
-            try:
-                opened = webbrowser.open(url)
-                if opened:
-                    log(f"Opened via webbrowser: {url}")
-            except Exception as e:
-                log_err(f"webbrowser failed: {e}")
-        if not opened:
-            log(f"Server started: {url}")
-            log("(Không tự mở được trình duyệt. Hãy mở URL trên bằng tay.)")
-    threading.Thread(target=_go, daemon=True).start()
+            if webbrowser.open(url):
+
+                log(
+                    f"Browser opened: {url}"
+                )
+
+                return
+
+        except Exception:
+            pass
+
+
+        log(
+            f"Open manually: {url}"
+        )
+
+
+    threading.Thread(
+        target=worker,
+        daemon=True,
+    ).start()
+
 
 # ============================================================
 # MAIN
 # ============================================================
+
 def main():
-    print("=" * 60)
+
+    global PORT
+
+    print()
+    print("=" * 70)
     print(" SO LOGIC RECONSTRUCTOR")
-    print("=" * 60)
+    print(" by MC_meme_edit")
+    print("=" * 70)
+    print()
 
     check_python()
+
     prepare_workspace()
-    check_dependencies(auto_install=True)
+
+    check_dependencies()
+
     check_storage()
 
-    if not check_port(PORT):
-        # thử port khác
-        global PORT
-        for p in range(PORT + 1, PORT + 20):
-            if check_port(p):
-                PORT = p
-                log(f"Using port {PORT} instead.")
-                break
-        else:
-            log_err("No free port found.")
+
+    # --------------------------------------------------------
+    # Find port
+    # --------------------------------------------------------
+
+    if not port_available(PORT):
+
+        log(
+            f"Port {PORT} is busy."
+        )
+
+        new_port = find_free_port(
+            PORT + 1
+        )
+
+        if new_port is None:
+
+            log_error(
+                "No free port found."
+            )
+
             sys.exit(1)
 
-    log(f"Starting server on http://{HOST}:{PORT}")
+        PORT = new_port
+
+        log(
+            f"Using port {PORT}."
+        )
+
+
+    # --------------------------------------------------------
+    # Server
+    # --------------------------------------------------------
+
+    address = (
+        f"http://{HOST}:{PORT}"
+    )
+
+    log(
+        f"Starting server: "
+        f"{address}"
+    )
+
+
     try:
-        httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    except Exception as e:
-        log_err(f"Cannot start server: {e}")
+
+        server = (
+            ThreadingHTTPServer(
+                (HOST, PORT),
+                Handler
+            )
+        )
+
+    except Exception as error:
+
+        log_error(
+            f"Server startup failed: "
+            f"{error}"
+        )
+
         sys.exit(1)
 
-    url = f"http://{HOST}:{PORT}"
-    log(f"Server ready: {url}")
-    open_browser(url)
 
-    def _stop(sig, frame):
+    log(
+        f"Server ready: {address}"
+    )
+
+    open_browser(
+        address
+    )
+
+
+    # --------------------------------------------------------
+    # Shutdown
+    # --------------------------------------------------------
+
+    def shutdown(
+        signum=None,
+        frame=None
+    ):
+
         print()
-        log("Shutting down...")
+
+        log(
+            "Shutting down server..."
+        )
+
         try:
-            httpd.shutdown()
+
+            server.shutdown()
+
         except Exception:
             pass
-        sys.exit(0)
 
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
 
     try:
-        httpd.serve_forever()
+
+        signal.signal(
+            signal.SIGINT,
+            shutdown
+        )
+
+        signal.signal(
+            signal.SIGTERM,
+            shutdown
+        )
+
+    except Exception:
+        pass
+
+
+    try:
+
+        server.serve_forever()
+
     except KeyboardInterrupt:
-        _stop(None, None)
+
+        shutdown()
+
+    finally:
+
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+        log(
+            "Server stopped."
+        )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
