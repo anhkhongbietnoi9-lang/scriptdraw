@@ -1,0 +1,1012 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SO LOGIC RECONSTRUCTOR
+- Single-file reverse engineering toolkit for Termux/Android
+- Author: (theo yêu cầu) MC_meme_edit
+- Chạy: python main.py
+"""
+
+import os
+import sys
+import json
+import time
+import shutil
+import socket
+import signal
+import struct
+import hashlib
+import subprocess
+import threading
+import webbrowser
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+# ============================================================
+# CẤU HÌNH
+# ============================================================
+HOST = "127.0.0.1"
+PORT = 8000
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE = os.path.join(BASE_DIR, "workspace")
+UPLOAD_DIR = os.path.join(WORKSPACE, "uploads")
+OUTPUT_DIR = os.path.join(WORKSPACE, "output")
+TEMP_DIR   = os.path.join(WORKSPACE, "temp")
+LOG_DIR    = os.path.join(WORKSPACE, "logs")
+
+PY_DEPS = ["capstone", "pyelftools"]
+NATIVE_DEPS = ["objdump", "readelf", "file"]
+
+# ============================================================
+# LOGGER
+# ============================================================
+def log(msg, tag="+"):
+    print(f"[{tag}] {msg}", flush=True)
+
+def log_err(msg):
+    print(f"[!] {msg}", flush=True)
+
+# ============================================================
+# KIỂM TRA MÔI TRƯỜNG
+# ============================================================
+def is_termux():
+    return "com.termux" in os.environ.get("PREFIX", "") or \
+           os.path.exists("/data/data/com.termux/files/usr")
+
+def check_python():
+    log(f"Checking Python... {sys.version.split()[0]}")
+    if sys.version_info < (3, 7):
+        log_err("Python >= 3.7 required.")
+        sys.exit(1)
+
+def has_cmd(cmd):
+    return shutil.which(cmd) is not None
+
+def pip_install(pkg):
+    log(f"Installing pip package: {pkg}")
+    for extra in ([], ["--user"]):
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", *extra, pkg],
+                capture_output=True, text=True, timeout=600
+            )
+            if r.returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+def apt_install(pkg):
+    log(f"Installing apt package: {pkg}")
+    try:
+        r = subprocess.run(["pkg", "install", "-y", pkg],
+                           capture_output=True, text=True, timeout=900)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def check_dependencies(auto_install=True):
+    log("Checking Python dependencies...")
+    missing_py = []
+    for pkg in PY_DEPS:
+        try:
+            __import__(pkg)
+            log(f"  OK: {pkg}")
+        except ImportError:
+            missing_py.append(pkg)
+            log(f"  MISSING: {pkg}")
+
+    if missing_py and auto_install:
+        for pkg in missing_py:
+            if not pip_install(pkg):
+                log_err(f"Missing dependency: {pkg}")
+                log_err(f"Please install manually: pip install {pkg}")
+                sys.exit(1)
+
+    log("Checking native reverse-engineering tools...")
+    missing_native = [c for c in NATIVE_DEPS if not has_cmd(c)]
+    if missing_native and auto_install and is_termux():
+        # binutils cung cấp objdump + readelf
+        apt_install("binutils")
+        apt_install("file")
+        missing_native = [c for c in NATIVE_DEPS if not has_cmd(c)]
+
+    if missing_native:
+        for m in missing_native:
+            log_err(f"Missing dependency: {m}")
+        log_err("Please install it before continuing (e.g. pkg install binutils file).")
+        sys.exit(1)
+
+def check_storage():
+    log("Checking Termux environment...")
+    if not is_termux():
+        log("  Not running on Termux (PC/dev mode). Skipping storage check.")
+        return
+    dl = "/sdcard/Download"
+    if not os.path.exists("/sdcard"):
+        log_err("Storage permission not granted.")
+        log_err("Please run: termux-setup-storage")
+    elif not os.path.exists(dl):
+        log(f"  Warning: {dl} not found (still OK).")
+    else:
+        log(f"  Download dir OK: {dl}")
+
+def check_port(port):
+    log(f"Checking port {port}...")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((HOST, port))
+        s.close()
+        return True
+    except OSError:
+        log_err(f"Port {port} is in use.")
+        return False
+
+# ============================================================
+# WORKSPACE
+# ============================================================
+def prepare_workspace():
+    log("Preparing workspace...")
+    for d in (WORKSPACE, UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR, LOG_DIR):
+        os.makedirs(d, exist_ok=True)
+    log(f"  Workspace: {WORKSPACE}")
+
+# ============================================================
+# PHÂN TÍCH ELF
+# ============================================================
+class ELFAnalyzer:
+    """Phân tích ELF thật, KHÔNG bịa. Nếu thiếu info -> đánh dấu UNKNOWN."""
+
+    ARCH_MAP = {
+        "EM_386": "x86",
+        "EM_X86_64": "x86_64",
+        "EM_ARM": "ARM",
+        "EM_AARCH64": "ARM64",
+        "EM_MIPS": "MIPS",
+        "EM_RISCV": "RISC-V",
+    }
+
+    CAPSTONE_MODE = {
+        "x86":     ("CS_ARCH_X86", "CS_MODE_32"),
+        "x86_64":  ("CS_ARCH_X86", "CS_MODE_64"),
+        "ARM":     ("CS_ARCH_ARM", "CS_MODE_ARM"),
+        "ARM64":   ("CS_ARCH_ARM64", "CS_MODE_ARM"),
+        "MIPS":    ("CS_ARCH_MIPS", "CS_MODE_MIPS32"),
+        "RISC-V":  ("CS_ARCH_RISCV", "CS_MODE_RISCV64"),
+    }
+
+    def __init__(self, path):
+        self.path = path
+        self.elf = None
+        self.arch = None
+        self.bits = 64
+        self.endian = "<"
+        self.symbols = {}
+        self.dynsyms = {}
+        self.functions = []
+        self.strings = []
+        self.warnings = []
+
+    def load(self):
+        from elftools.elf.elffile import ELFFile
+        with open(self.path, "rb") as f:
+            self.elf = ELFFile(f)
+            e_machine = self.elf.header["e_machine"]
+            self.arch = self.ARCH_MAP.get(e_machine, None)
+            if self.arch is None:
+                raise ValueError(f"Unsupported architecture: {e_machine}")
+            self.bits = self.elf.elfclass
+            self.endian = "<" if self.elf.little_endian else ">"
+
+    def collect_symbols(self):
+        from elftools.elf.sections import SymbolTableSection
+        for sec in self.elf.iter_sections():
+            if isinstance(sec, SymbolTableSection):
+                for sym in sec.iter_symbols():
+                    if sym.name and sym["st_value"]:
+                        self.symbols[sym.name] = {
+                            "value": sym["st_value"],
+                            "size": sym["st_size"],
+                            "type": sym["st_info"]["type"],
+                            "bind": sym["st_info"]["bind"],
+                        }
+        if not self.symbols:
+            self.warnings.append(
+                "Warning: Symbols are stripped. "
+                "Function and variable names may be unavailable."
+            )
+
+    def collect_strings(self, min_len=5):
+        with open(self.path, "rb") as f:
+            data = f.read()
+        cur = bytearray()
+        cur_off = 0
+        for i, b in enumerate(data):
+            if 0x20 <= b < 0x7f:
+                if not cur:
+                    cur_off = i
+                cur.append(b)
+            else:
+                if len(cur) >= min_len:
+                    self.strings.append({
+                        "offset": cur_off,
+                        "value": cur.decode("ascii", "replace"),
+                    })
+                cur = bytearray()
+        if len(cur) >= min_len:
+            self.strings.append({
+                "offset": cur_off,
+                "value": cur.decode("ascii", "replace"),
+            })
+
+    def collect_functions(self):
+        # Lấy từ symbol table (FUNC type = 'STT_FUNC')
+        for name, info in self.symbols.items():
+            if info["type"] == "STT_FUNC":
+                self.functions.append({
+                    "name": name,
+                    "addr": info["value"],
+                    "size": info["size"],
+                    "source": "symtab",
+                })
+        # Sắp xếp theo địa chỉ
+        self.functions.sort(key=lambda x: x["addr"])
+
+    def disassemble_function(self, addr, size, max_insns=400):
+        from capstone import Cs, CS_OP_IMM, CS_OP_MEM, CS_OP_REG
+        try:
+            import capstone as cs_mod
+        except ImportError:
+            return []
+
+        arch_name, mode_name = self.CAPSTONE_MODE.get(
+            self.arch, (None, None))
+        if not arch_name:
+            return []
+        arch = getattr(cs_mod, arch_name, None)
+        mode = getattr(cs_mod, mode_name, 0)
+        if arch is None:
+            return []
+        md = Cs(arch, mode)
+        md.detail = True
+
+        # Lấy bytes
+        with open(self.path, "rb") as f:
+            raw = f.read()
+        # Chuyển vaddr -> file offset
+        from elftools.elf.elffile import ELFFile
+        seg_off = None
+        for seg in self.elf.iter_segments():
+            if seg["p_type"] == "PT_LOAD":
+                v = seg["p_vaddr"]
+                if v <= addr < v + seg["p_filesz"]:
+                    seg_off = seg["p_offset"] + (addr - v)
+                    break
+        if seg_off is None:
+            return []
+        code = raw[seg_off: seg_off + max(size, 64)]
+
+        insns = []
+        for insn in md.disasm(code, addr):
+            insns.append({
+                "addr": insn.address,
+                "mnemonic": insn.mnemonic,
+                "op_str": insn.op_str,
+                "bytes": insn.bytes.hex(),
+            })
+            if len(insns) >= max_insns:
+                break
+        return insns
+
+    def analyze(self):
+        self.load()
+        self.collect_symbols()
+        self.collect_strings()
+        self.collect_functions()
+        return self
+
+# ============================================================
+# TÁI TẠO LOGIC (pseudocode) - CHỈ DỰA TRÊN PATTERN THẬT
+# ============================================================
+class LogicReconstructor:
+    """
+    Chuyển assembly -> pseudocode đọc được.
+    Nguyên tắc:
+    - Mỗi instruction map sang 1 dòng có cấu trúc.
+    - Nếu không đủ evidence -> UNKNOWN_OPERATION.
+    - Sinh if/while dựa trên nhận diện branch pattern.
+    """
+
+    # x86 & ARM branch mnemonics
+    JMP = {"jmp", "b", "bx", "br", "jr", "j"}
+    JCC = {
+        "je","jz","jne","jnz","jg","jge","jl","jle","ja","jae","jb","jbe",
+        "js","jns","jo","jno","jp","jnp","jc","jnc",
+        "beq","bne","bgt","bge","blt","ble","bhi","bls",
+        "cbz","cbnz","tbz","tbnz",
+    }
+    CALL = {"call", "callq", "bl", "blx", "jal", "jalr", "blr"}
+    RET  = {"ret", "retq", "bx lr", "pop"}  # pop {..,pc} in ARM = return
+    NOP  = {"nop", "nop.w"}
+    CMP  = {"cmp", "cmn", "tst", "teq", "subs"}
+
+    def __init__(self, analyzer):
+        self.a = analyzer
+
+    def _label(self, addr):
+        return f"loc_{addr:x}"
+
+    def _op(self, insn):
+        return f"{insn['mnemonic']} {insn['op_str']}".strip()
+
+    def reconstruct(self, func):
+        name = func["name"]
+        addr = func["addr"]
+        size = func["size"]
+        if size == 0:
+            return (
+                f"// function {name} @ 0x{addr:x}\n"
+                f"// UNKNOWN_OPERATION( address = 0x{addr:x}, "
+                f"reason = \"symbol size is zero, cannot delimit function\" )\n"
+            )
+
+        insns = self.a.disassemble_function(addr, size)
+        if not insns:
+            return (
+                f"// function {name} @ 0x{addr:x}\n"
+                f"// UNKNOWN_OPERATION( address = 0x{addr:x}, "
+                f"reason = \"no disassembly produced\" )\n"
+            )
+
+        lines = []
+        lines.append(f"// ---- function {name} @ 0x{addr:x} "
+                     f"(size={size}, arch={self.a.arch}) ----")
+        argn = self._guess_arg_count(insns)
+        args = ", ".join(f"arg_{i}" for i in range(argn))
+        lines.append(f"function_{addr:x}({args}) {{")
+
+        indent = "    "
+        # Đơn giản hóa: duyệt tuần tự, phát hiện if/while bằng pattern
+        for i, insn in enumerate(insns):
+            mn = insn["mnemonic"]
+            txt = self._op(insn)
+            ln = f"{indent}// {hex(insn['addr'])}: {txt}"
+
+            if mn in self.NOP:
+                continue
+
+            if mn in self.CALL:
+                tgt = self._extract_call_target(insn)
+                if tgt is not None:
+                    lines.append(f"{indent}call_0x{tgt:x}();   // {txt}")
+                else:
+                    lines.append(f"{indent}// CALL (indirect): {txt}")
+                continue
+
+            if mn in self.RET or (mn == "pop" and "pc" in insn["op_str"]):
+                lines.append(f"{indent}return;   // {txt}")
+                continue
+
+            if mn in self.JCC:
+                tgt = self._extract_branch_target(insn)
+                cond = self._cond_from_jcc(mn)
+                if tgt is not None:
+                    lines.append(
+                        f"{indent}if ({cond}) goto {self._label(tgt)};   // {txt}"
+                    )
+                else:
+                    lines.append(f"{indent}// BRANCH-UNKNOWN: {txt}")
+                continue
+
+            if mn in self.JMP:
+                tgt = self._extract_branch_target(insn)
+                if tgt is not None:
+                    lines.append(f"{indent}goto {self._label(tgt)};")
+                else:
+                    lines.append(f"{indent}// JUMP (indirect): {txt}")
+                continue
+
+            if mn in self.CMP:
+                lines.append(f"{indent}// {txt}")
+                continue
+
+            # Các lệnh còn lại -> đánh dấu UNKNOWN để không bịa ngữ nghĩa
+            lines.append(
+                f"{indent}UNKNOWN_OPERATION( address = 0x{insn['addr']:x}, "
+                f"reason = \"raw {mn}: {insn['op_str']}\" );"
+            )
+
+        lines.append("}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _extract_call_target(self, insn):
+        s = insn["op_str"]
+        if s.startswith("0x"):
+            try:
+                return int(s.split()[0], 16)
+            except Exception:
+                return None
+        return None
+
+    def _extract_branch_target(self, insn):
+        s = insn["op_str"]
+        if s.startswith("0x"):
+            try:
+                return int(s.split()[0], 16)
+            except Exception:
+                return None
+        return None
+
+    def _cond_from_jcc(self, mn):
+        table = {
+            "je":"a == b","jz":"a == 0","jne":"a != b","jnz":"a != 0",
+            "jg":"a > b (signed)","jge":"a >= b (signed)",
+            "jl":"a < b (signed)","jle":"a <= b (signed)",
+            "ja":"a > b (unsigned)","jae":"a >= b (unsigned)",
+            "jb":"a < b (unsigned)","jbe":"a <= b (unsigned)",
+            "js":"sign_flag","jns":"!sign_flag",
+            "jo":"overflow","jno":"!overflow",
+            "beq":"arg0 == arg1","bne":"arg0 != arg1",
+            "bgt":"arg0 > arg1","bge":"arg0 >= arg1",
+            "blt":"arg0 < arg1","ble":"arg0 <= arg1",
+            "cbz":"arg0 == 0","cbnz":"arg0 != 0",
+        }
+        return table.get(mn, "condition_unknown")
+
+    def _guess_arg_count(self, insns):
+        # Heuristic tối thiểu: đếm thanh ghi arg được đọc trong ~30 lệnh đầu
+        regs_x86 = {"rdi","rsi","rdx","rcx","r8","r9"}
+        regs_arm = {"x0","x1","x2","x3","x4","x5","x6","x7",
+                    "w0","w1","w2","w3","w4","w5","w6","w7"}
+        found = set()
+        for ins in insns[:40]:
+            for tok in ins["op_str"].replace(",", " ").split():
+                t = tok.strip()
+                if t in regs_x86 or t in regs_arm:
+                    found.add(t)
+        if not found:
+            return 0
+        # map về chỉ số
+        def idx(r):
+            if r in regs_x86:
+                return ["rdi","rsi","rdx","rcx","r8","r9"].index(r)
+            if r.startswith(("x","w")):
+                try:
+                    return int(r[1:])
+                except Exception:
+                    return 0
+            return 0
+        return min(6, max(idx(r) for r in found) + 1)
+
+# ============================================================
+# PIPELINE PHÂN TÍCH CHÍNH
+# ============================================================
+def analyze_so(so_path, job_id):
+    log(f"Analyzing {so_path}...")
+    start = time.time()
+    report_lines = []
+    report_lines.append("=" * 60)
+    report_lines.append("SO LOGIC RECONSTRUCTOR - OUTPUT")
+    report_lines.append("=" * 60)
+    report_lines.append(f"File: {os.path.basename(so_path)}")
+    report_lines.append(f"Job:  {job_id}")
+    report_lines.append(f"SHA1: {hashlib.sha1(open(so_path,'rb').read()).hexdigest()}")
+    report_lines.append("")
+
+    # 1. Kiểm tra ELF
+    try:
+        with open(so_path, "rb") as f:
+            magic = f.read(4)
+    except Exception as e:
+        return {"ok": False, "error": f"Cannot read file: {e}"}
+
+    if magic != b"\x7fELF":
+        return {"ok": False, "error": "Invalid ELF file."}
+
+    # 2. Load ELF
+    try:
+        analyzer = ELFAnalyzer(so_path).analyze()
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": f"ELF parse error: {e}"}
+
+    report_lines.append("--- ELF HEADER ---")
+    report_lines.append(f"Architecture : {analyzer.arch}")
+    report_lines.append(f"Bits         : {analyzer.bits}")
+    report_lines.append(f"Endian       : {'little' if analyzer.endian=='<' else 'big'}")
+    report_lines.append("")
+
+    if analyzer.warnings:
+        report_lines.append("--- WARNINGS ---")
+        for w in analyzer.warnings:
+            report_lines.append(w)
+        report_lines.append("")
+
+    # 3. Sections
+    report_lines.append("--- SECTIONS ---")
+    for sec in analyzer.elf.iter_sections():
+        try:
+            report_lines.append(
+                f"  {sec.name:<20} type={sec['sh_type']:<16} "
+                f"addr=0x{sec['sh_addr']:x} size=0x{sec['sh_size']:x}"
+            )
+        except Exception:
+            pass
+    report_lines.append("")
+
+    # 4. Strings (giới hạn 200)
+    report_lines.append(f"--- STRINGS (showing up to 200 of {len(analyzer.strings)}) ---")
+    for s in analyzer.strings[:200]:
+        report_lines.append(f"  0x{s['offset']:08x}: {s['value']}")
+    report_lines.append("")
+
+    # 5. Functions
+    report_lines.append(f"--- FUNCTIONS ({len(analyzer.functions)}) ---")
+    for fn in analyzer.functions:
+        report_lines.append(
+            f"  {fn['name']:<40} @ 0x{fn['addr']:x}  size=0x{fn['size']:x}"
+        )
+    report_lines.append("")
+
+    if not analyzer.functions:
+        report_lines.append(
+            "Partial reconstruction: No FUNC symbols found in binary. "
+            "Cannot enumerate function boundaries reliably. "
+            "Only sections/strings above are trustworthy."
+        )
+
+    # 6. Reconstruct từng function
+    report_lines.append("=" * 60)
+    report_lines.append("--- RECONSTRUCTED LOGIC ---")
+    report_lines.append("=" * 60)
+    recon = LogicReconstructor(analyzer)
+    for fn in analyzer.functions:
+        try:
+            report_lines.append(recon.reconstruct(fn))
+        except Exception as e:
+            report_lines.append(
+                f"// function {fn['name']} @ 0x{fn['addr']:x}"
+            )
+            report_lines.append(
+                f"// UNKNOWN_OPERATION( address = 0x{fn['addr']:x}, "
+                f"reason = \"reconstruction failed: {e}\" )"
+            )
+            report_lines.append("")
+
+    elapsed = time.time() - start
+    report_lines.append("=" * 60)
+    report_lines.append(f"Done in {elapsed:.2f}s")
+    report_lines.append("=" * 60)
+
+    text = "\n".join(report_lines)
+
+    # Lưu output
+    out_path = os.path.join(OUTPUT_DIR, f"{job_id}.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    # Log file
+    log_path = os.path.join(LOG_DIR, f"{job_id}.log")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "arch": analyzer.arch,
+        "bits": analyzer.bits,
+        "num_functions": len(analyzer.functions),
+        "num_strings": len(analyzer.strings),
+        "warnings": analyzer.warnings,
+        "text": text,
+        "download": f"/download/{job_id}",
+    }
+
+# ============================================================
+# HTML/CSS/JS FRONTEND (nhúng thẳng)
+# ============================================================
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>SO LOGIC RECONSTRUCTOR</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1f2630;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#2f81f7;
+    --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    font-size:15px; line-height:1.45;
+  }
+  header{
+    padding:14px 16px; background:var(--panel);
+    border-bottom:1px solid #30363d; text-align:center; font-weight:700;
+    letter-spacing:1px;
+  }
+  main{padding:14px; max-width:900px; margin:0 auto}
+  .card{
+    background:var(--panel); border:1px solid #30363d;
+    border-radius:10px; padding:14px; margin-bottom:14px;
+  }
+  label.file{
+    display:block; padding:14px; border:2px dashed #30363d;
+    border-radius:10px; text-align:center; color:var(--muted);
+    cursor:pointer;
+  }
+  label.file input{display:none}
+  button{
+    background:var(--accent); color:#fff; border:0; padding:12px 16px;
+    border-radius:8px; font-weight:600; font-size:15px; cursor:pointer;
+    width:100%; margin-top:10px;
+  }
+  button:disabled{opacity:.5; cursor:not-allowed}
+  button.secondary{background:#30363d}
+  .row{display:flex; gap:8px; margin-top:10px}
+  .row button{margin-top:0}
+  .progress{
+    height:10px; background:#30363d; border-radius:5px; overflow:hidden;
+    margin-top:8px;
+  }
+  .progress > div{
+    height:100%; width:0%; background:var(--accent);
+    transition:width .3s ease;
+  }
+  .status{color:var(--muted); font-size:13px; margin-top:6px}
+  .warn{color:var(--warn)}
+  .err{color:var(--err)}
+  textarea{
+    width:100%; min-height:340px; background:#0b0f14; color:#c9d1d9;
+    border:1px solid #30363d; border-radius:8px; padding:10px;
+    font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px;
+    line-height:1.5; resize:vertical;
+  }
+  .meta{font-size:12px; color:var(--muted); margin:6px 0}
+  .hidden{display:none}
+  h2{font-size:14px; margin:0 0 8px; color:var(--muted); text-transform:uppercase; letter-spacing:1px}
+</style>
+</head>
+<body>
+<header>SO LOGIC RECONSTRUCTOR</header>
+<main>
+
+  <div class="card">
+    <label class="file" id="drop">
+      <input type="file" id="file" accept=".so,application/octet-stream">
+      <span id="fileName">📂 Chọn file .so</span>
+    </label>
+    <button id="run" disabled>Dịch ngược</button>
+    <div class="progress"><div id="bar"></div></div>
+    <div class="status" id="status">Sẵn sàng.</div>
+  </div>
+
+  <div class="card hidden" id="resultCard">
+    <h2>Decompiled Logic</h2>
+    <div class="meta" id="meta"></div>
+    <textarea id="editor" spellcheck="false"></textarea>
+    <div class="row">
+      <button class="secondary" id="copy">Copy</button>
+      <button class="secondary" id="save">Save TXT</button>
+      <button id="download">Download TXT</button>
+    </div>
+    <div class="status" id="dlStatus"></div>
+  </div>
+
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const fileInput = $("#file");
+const btnRun = $("#run");
+const bar = $("#bar");
+const statusEl = $("#status");
+const resultCard = $("#resultCard");
+const editor = $("#editor");
+const meta = $("#meta");
+let currentText = "";
+let currentJob = "";
+
+fileInput.addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("#fileName").textContent = "📄 " + f.name;
+  btnRun.disabled = false;
+});
+
+function setStatus(t, cls=""){
+  statusEl.textContent = t;
+  statusEl.className = "status " + cls;
+}
+function setBar(p){ bar.style.width = p + "%"; }
+
+btnRun.addEventListener("click", async () => {
+  const f = fileInput.files[0];
+  if (!f) return;
+  btnRun.disabled = true;
+  resultCard.classList.add("hidden");
+  setBar(0);
+  setStatus("Đang upload...");
+
+  const fd = new FormData();
+  fd.append("file", f);
+
+  try{
+    setBar(5);
+    const xhr = new XMLHttpRequest();
+    const p = new Promise((res, rej) => {
+      xhr.open("POST", "/analyze");
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable){
+          setBar(5 + (e.loaded/e.total)*15);
+        }
+      };
+      xhr.onload = () => res(xhr);
+      xhr.onerror = () => rej(new Error("Network error"));
+      xhr.send(fd);
+    });
+    setStatus("Đang phân tích ELF (có thể mất vài giây)...");
+    setBar(25);
+    const xhr = await p;
+    setBar(100);
+    if (xhr.status !== 200){
+      setStatus("Lỗi: " + xhr.responseText, "err");
+      btnRun.disabled = false;
+      return;
+    }
+    const data = JSON.parse(xhr.responseText);
+    if (!data.ok){
+      setStatus("Lỗi: " + data.error, "err");
+      btnRun.disabled = false;
+      return;
+    }
+    currentText = data.text;
+    currentJob = data.job_id;
+    editor.value = currentText;
+    meta.textContent =
+      `Arch: ${data.arch} | Bits: ${data.bits} | ` +
+      `Functions: ${data.num_functions} | Strings: ${data.num_strings}` +
+      (data.warnings && data.warnings.length ? " | ⚠ " + data.warnings.join(" ") : "");
+    resultCard.classList.remove("hidden");
+    setStatus("Hoàn tất.", "");
+  }catch(e){
+    setStatus("Lỗi: " + e.message, "err");
+  }finally{
+    btnRun.disabled = false;
+  }
+});
+
+$("#copy").addEventListener("click", async () => {
+  try{
+    await navigator.clipboard.writeText(editor.value);
+    setStatus("Đã copy vào clipboard.");
+  }catch(e){
+    setStatus("Không copy được: " + e.message, "err");
+  }
+});
+
+$("#save").addEventListener("click", () => {
+  const blob = new Blob([editor.value], {type:"text/plain;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "decompiled_logic.txt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+$("#download").addEventListener("click", () => {
+  if (!currentJob) return;
+  window.location = "/download/" + currentJob;
+});
+</script>
+</body>
+</html>
+"""
+
+# ============================================================
+# HTTP SERVER
+# ============================================================
+class Handler(BaseHTTPRequestHandler):
+    server_version = "SORecon/1.0"
+
+    def log_message(self, fmt, *args):
+        # log gọn
+        print(f"[web] {self.address_string()} - {fmt % args}", flush=True)
+
+    def _send(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+
+        if path == "/" or path == "/index.html":
+            body = INDEX_HTML.encode("utf-8")
+            self._send(200, body, "text/html; charset=utf-8")
+            return
+
+        if path.startswith("/download/"):
+            job_id = path.rsplit("/", 1)[-1]
+            job_id = "".join(c for c in job_id if c.isalnum() or c in "-_")
+            fpath = os.path.join(OUTPUT_DIR, f"{job_id}.txt")
+            if not os.path.isfile(fpath):
+                self._send(404, b"Not found")
+                return
+            with open(fpath, "rb") as f:
+                data = f.read()
+            self._send(200, data, "text/plain; charset=utf-8", {
+                "Content-Disposition": f'attachment; filename="decompiled_logic.txt"'
+            })
+            return
+
+        self._send(404, b"Not found")
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != "/analyze":
+            self._send(404, b"Not found")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send(400, b"Bad length")
+            return
+
+        if length <= 0 or length > 200 * 1024 * 1024:
+            self._send(400, b"Invalid size")
+            return
+
+        raw = self.rfile.read(length)
+        boundary = None
+        ctype = self.headers.get("Content-Type", "")
+        if "boundary=" in ctype:
+            boundary = ctype.split("boundary=", 1)[1].encode()
+        if not boundary:
+            self._send(400, b"No boundary")
+            return
+
+        # Parse multipart đơn giản
+        parts = raw.split(b"--" + boundary)
+        file_bytes = None
+        for p in parts:
+            if b'name="file"' in p:
+                try:
+                    header_end = p.index(b"\r\n\r\n") + 4
+                except ValueError:
+                    continue
+                file_bytes = p[header_end:]
+                # Cắt \r\n cuối
+                if file_bytes.endswith(b"\r\n"):
+                    file_bytes = file_bytes[:-2]
+                break
+
+        if not file_bytes:
+            self._send(400, b"No file")
+            return
+
+        if file_bytes[:4] != b"\x7fELF":
+            self._send(200, json.dumps({
+                "ok": False,
+                "error": "Invalid ELF file."
+            }).encode("utf-8"), "application/json")
+            return
+
+        job_id = hashlib.md5(
+            file_bytes + str(time.time()).encode()
+        ).hexdigest()[:12]
+        fname = f"{job_id}.so"
+        fpath = os.path.join(UPLOAD_DIR, fname)
+        with open(fpath, "wb") as f:
+            f.write(file_bytes)
+
+        try:
+            result = analyze_so(fpath, job_id)
+            self._send(200, json.dumps(result).encode("utf-8"),
+                       "application/json")
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(tb, flush=True)
+            self._send(500, json.dumps({
+                "ok": False,
+                "error": f"Internal error: {e}"
+            }).encode("utf-8"), "application/json")
+
+# ============================================================
+# MỞ TRÌNH DUYỆT
+# ============================================================
+def open_browser(url):
+    def _go():
+        time.sleep(1.2)
+        # Thử Termux API trước (ổn định nhất trên Android)
+        opened = False
+        if has_cmd("termux-open-url"):
+            try:
+                subprocess.run(["termux-open-url", url],
+                               capture_output=True, timeout=10)
+                opened = True
+                log(f"Opened via termux-open-url: {url}")
+            except Exception as e:
+                log_err(f"termux-open-url failed: {e}")
+        if not opened:
+            try:
+                opened = webbrowser.open(url)
+                if opened:
+                    log(f"Opened via webbrowser: {url}")
+            except Exception as e:
+                log_err(f"webbrowser failed: {e}")
+        if not opened:
+            log(f"Server started: {url}")
+            log("(Không tự mở được trình duyệt. Hãy mở URL trên bằng tay.)")
+    threading.Thread(target=_go, daemon=True).start()
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    print("=" * 60)
+    print(" SO LOGIC RECONSTRUCTOR")
+    print("=" * 60)
+
+    check_python()
+    prepare_workspace()
+    check_dependencies(auto_install=True)
+    check_storage()
+
+    if not check_port(PORT):
+        # thử port khác
+        global PORT
+        for p in range(PORT + 1, PORT + 20):
+            if check_port(p):
+                PORT = p
+                log(f"Using port {PORT} instead.")
+                break
+        else:
+            log_err("No free port found.")
+            sys.exit(1)
+
+    log(f"Starting server on http://{HOST}:{PORT}")
+    try:
+        httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    except Exception as e:
+        log_err(f"Cannot start server: {e}")
+        sys.exit(1)
+
+    url = f"http://{HOST}:{PORT}"
+    log(f"Server ready: {url}")
+    open_browser(url)
+
+    def _stop(sig, frame):
+        print()
+        log("Shutting down...")
+        try:
+            httpd.shutdown()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        _stop(None, None)
+
+if __name__ == "__main__":
+    main()
